@@ -1,12 +1,12 @@
 # src/eval/mf_baseline.py
 # --------------------------------------------------------------------------------------
-# Baseline de "matched filtering" (estilo) via correlação cruzada normalizada (NCC)
-# usando um banco simples de templates IMRPhenomD (pycbc) reamostrados para fs alvo.
+# Baseline de "matched filtering style" via correlação cruzada normalizada (NCC) em
+# todos os lags (FFT) contra um banco IMRPhenomD (pycbc), reamostrado para fs alvo.
 #
-# NÃO depende de /windows/data. Lê apenas os metadados das janelas e puxa o trecho
-# bruto a partir do arquivo *_whitened.hdf5 original (via meta_in.source_path).
+# Lê apenas metadados de janelas em data/processed/*_windows.hdf5 e extrai os trechos
+# diretamente dos arquivos *_whitened.hdf5 (via meta_in.source_path corrigido).
 #
-# Saída: reports/mf_baseline/YYYYmmdd-HHMMSS/ com CSVs, PNGs e cache de templates.
+# Saída: reports/mf_baseline/YYYYmmdd-HHMMSS/ com CSVs, PNGs e summary.json.
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -24,10 +24,12 @@ from typing import Dict, Tuple, Optional, List
 import h5py
 import numpy as np
 import pandas as pd
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
 
 from scipy.signal import resample_poly, fftconvolve, get_window
@@ -38,11 +40,9 @@ from pycbc.waveform import get_td_waveform
 # -----------------------------------
 @dataclass
 class CFG:
-    PARQUET_PATH: str = "data/processed/dataset.parquet"   # preferido
-    CSV_FALLBACK: str = "data/processed/dataset_preview.csv"  # fallback
-    WINDOWS_DIR: str   = "data/processed"                  # onde estão *_windows.hdf5
-
-    # quais subsets usar; se 'subset' não existir, criaremos val/test estratificados
+    # dataset
+    PARQUET_PATH: str = "data/processed/dataset.parquet"
+    WINDOWS_DIR: str   = "data/processed"
     SUBSETS: Tuple[str, ...] = ("val", "test")
 
     # janela alvo
@@ -58,7 +58,7 @@ class CFG:
     F_LO: float  = 20.0
     HP_WINDOW_TAPER: float = 0.1
 
-    # threshold selection
+    # threshold
     MODE: str = "target_far"   # "target_far" ou "best_f1"
     TARGET_FAR: float = 1e-6
 
@@ -66,22 +66,29 @@ class CFG:
     OUT_DIR_ROOT: str = "reports/mf_baseline"
     CACHE_FILE: str   = "templates_cache.npz"
 
-    # debug/limites (None = tudo)
+    # debug / performance
     MAX_VAL_ROWS: Optional[int] = None
     MAX_TEST_ROWS: Optional[int] = None
+
+    # feedback de progresso
+    HEARTBEAT_EVERY_N: int = 2000      # imprime batimento a cada N janelas
+    HEARTBEAT_EVERY_SEC: float = 10.0  # ou a cada S segundos, o que vier primeiro
+    TQDM_MIN_INTERVAL: float = 0.5     # suaviza barra
 
 CFG = CFG()
 
 # -----------------------------------
-# Utils
+# Utils de I/O HDF5 e resolução de caminhos
 # -----------------------------------
 def read_attrs(obj) -> Dict[str, float | str]:
     out = {}
     try:
         for k, v in obj.attrs.items():
             if hasattr(v, "item"):
-                try: v = v.item()
-                except Exception: pass
+                try:
+                    v = v.item()
+                except Exception:
+                    pass
             out[str(k)] = v
     except Exception:
         pass
@@ -113,15 +120,15 @@ def find_window_file(file_id: str) -> Optional[str]:
     hits = glob(os.path.join(CFG.WINDOWS_DIR, "**", file_id), recursive=True)
     return hits[0] if hits else None
 
+# -----------------------------------
+# Templates IMRPhenomD
+# -----------------------------------
 def tukey_window(N: int, alpha: float = 0.1) -> np.ndarray:
     try:
         return get_window(("tukey", alpha), N, fftbins=False).astype(np.float32)
     except Exception:
         return get_window("hann", N, fftbins=False).astype(np.float32)
 
-# -----------------------------------
-# Templates
-# -----------------------------------
 def synth_template(m1: float, m2: float, spin1: float, spin2: float,
                    fs: int, wlen: int, f_low: float, alpha: float) -> np.ndarray:
     hp, _ = get_td_waveform(approximant="IMRPhenomD",
@@ -148,14 +155,15 @@ def synth_template(m1: float, m2: float, spin1: float, spin2: float,
 
 def build_template_bank(n: int) -> List[Tuple[float, float, float, float]]:
     side = int(math.sqrt(n))
+    side = max(1, side)
     m1s = np.linspace(CFG.M1_RANGE[0], CFG.M1_RANGE[1], side)
     m2s = np.linspace(CFG.M2_RANGE[0], CFG.M2_RANGE[1], side)
     bank = []
     for m1 in m1s:
         for m2 in m2s:
-            if len(bank) >= n: break
             bank.append((float(m1), float(m2), CFG.SPIN1, CFG.SPIN2))
-        if len(bank) >= n: break
+            if len(bank) >= n:
+                return bank
     return bank
 
 def build_template_cache(bank: List[Tuple[float, float, float, float]],
@@ -168,7 +176,7 @@ def build_template_cache(bank: List[Tuple[float, float, float, float]],
     return cache
 
 # -----------------------------------
-# Leitura da janela a partir do *_whitened
+# Leitura de uma janela (via whitened)
 # -----------------------------------
 def load_window_slice(win_file: str, start_gps: float) -> Optional[np.ndarray]:
     with h5py.File(win_file, "r") as f:
@@ -204,8 +212,8 @@ def load_window_slice(win_file: str, start_gps: float) -> Optional[np.ndarray]:
             fs_in = 1.0 / float(xs)
         fs_in = int(round(float(fs_in)))
 
-        with h5py.File(win_file, "r") as f:
-            starts = f["/windows/start_idx"][()]
+        with h5py.File(win_file, "r") as f2:
+            starts = f2["/windows/start_idx"][()]
             i0 = int(starts[idx0])
 
         wlen_in = int(round(CFG.WINDOW_SEC * fs_in))
@@ -229,7 +237,7 @@ def load_window_slice(win_file: str, start_gps: float) -> Optional[np.ndarray]:
     return sl
 
 # -----------------------------------
-# NCC por FFT (máximo nos lags)
+# NCC via FFT (máximo nos lags)
 # -----------------------------------
 def ncc_fft_max(x: np.ndarray, h: np.ndarray) -> float:
     if x.size != h.size:
@@ -245,7 +253,7 @@ def score_window(file_id: str, start_gps: float, tmpl_cache: Dict[str, np.ndarra
         p = find_window_file(file_id)
         if not p:
             return 0.0
-        x = load_window_slice(p, float(start_gps))
+        x = load_window_slice(p, start_gps)
         if x is None or not np.any(np.isfinite(x)):
             return 0.0
         best = 0.0
@@ -286,7 +294,20 @@ def pick_threshold(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]
     return best_thr, {"mode": "best_f1", "f1": best_f1}
 
 # -----------------------------------
-# Métricas e plots
+# Self-test (injeção)
+# -----------------------------------
+def self_test_ncc(tmpl_cache: Dict[str, np.ndarray]) -> float:
+    if not tmpl_cache:
+        return 0.0
+    key = next(iter(tmpl_cache.keys()))
+    hp = tmpl_cache[key].copy()
+    rng = np.random.default_rng(42)
+    x = hp + 0.3 * rng.standard_normal(hp.size).astype(np.float32)
+    x = (x - x.mean()) / (x.std() + 1e-12)
+    return float(ncc_fft_max(x, hp))
+
+# -----------------------------------
+# Plots
 # -----------------------------------
 def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, prefix: str):
     y_true = np.asarray(y_true).astype(int)
@@ -295,7 +316,6 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
     auc = roc_auc_score(y_true, scores) if len(np.unique(y_true)) > 1 else float("nan")
     ap  = average_precision_score(y_true, scores) if len(np.unique(y_true)) > 1 else float("nan")
 
-    # ROC
     try:
         fpr, tpr, _ = roc_curve(y_true, scores)
         plt.figure(figsize=(4.5,4.5))
@@ -309,7 +329,6 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
     except Exception:
         pass
 
-    # PR
     try:
         prec, rec, _ = precision_recall_curve(y_true, scores)
         plt.figure(figsize=(4.5,4.5))
@@ -322,7 +341,6 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
     except Exception:
         pass
 
-    # hist score por classe
     try:
         plt.figure(figsize=(5.8,3.4))
         plt.hist(scores[y_true==0], bins=60, alpha=.7, label="neg", density=True)
@@ -345,101 +363,81 @@ def confusion_at_threshold(y_true: np.ndarray, scores: np.ndarray, thr: float) -
     return tn, fp, fn, tp
 
 # -----------------------------------
-# Loader robusto do dataset
+# Scoring com progress feedback
 # -----------------------------------
-def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # possíveis aliases -> alvo
-    rename_map = {}
-    cols = {c.lower(): c for c in df.columns}
+def score_subset(name: str, df_subset: pd.DataFrame, tmpl_cache: Dict[str, np.ndarray]) -> np.ndarray:
+    n = len(df_subset)
+    scores = np.zeros(n, np.float32)
 
-    # file_id
-    for cand in ["file_id", "file", "fid", "hdf5"]:
-        if cand in cols:
-            rename_map[cols[cand]] = "file_id"; break
-    # start_gps
-    for cand in ["start_gps", "gps", "tstart", "start"]:
-        if cand in cols:
-            rename_map[cols[cand]] = "start_gps"; break
-    # label
-    for cand in ["label", "y", "target", "class"]:
-        if cand in cols:
-            rename_map[cols[cand]] = "label"; break
-    # subset
-    for cand in ["subset", "split", "partition", "set"]:
-        if cand in cols:
-            rename_map[cols[cand]] = "subset"; break
+    hb_n = CFG.HEARTBEAT_EVERY_N
+    hb_s = CFG.HEARTBEAT_EVERY_SEC
 
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    print(f"[3/?] Scoring {name}… (NCC em todos os lags)  |  total={n:,}")
+    t0 = time.time()
+    last_hb_t = t0
+    last_i = 0
 
-    # checagens mínimas
-    needed = ["file_id", "start_gps", "label"]
-    for k in needed:
-        if k not in df.columns:
-            raise KeyError(f"coluna obrigatória ausente no dataset: {k}")
+    with tqdm(total=n, unit="win", mininterval=CFG.TQDM_MIN_INTERVAL, leave=True) as bar:
+        for i, (fid, sgps) in enumerate(zip(df_subset["file_id"].values, df_subset["start_gps"].values), 1):
+            scores[i-1] = score_window(fid, float(sgps), tmpl_cache)
+            bar.update(1)
 
-    return df
+            # heartbeat por contagem
+            do_hb_n = (i % hb_n == 0)
+            # heartbeat por tempo
+            now = time.time()
+            do_hb_t = (now - last_hb_t) >= hb_s
 
-def _ensure_subset(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
-    if "subset" in df.columns:
-        return df
-    # criar split estratificado val/test (50/50) por label
-    rng = np.random.default_rng(seed)
-    df = df.copy()
-    df["subset"] = "val"
-    for y in df["label"].unique():
-        idx = df.index[df["label"] == y].to_numpy()
-        rng.shuffle(idx)
-        half = len(idx) // 2
-        df.loc[idx[half:], "subset"] = "test"
-    return df
+            if do_hb_n or do_hb_t:
+                done = i
+                elapsed = now - t0 + 1e-9
+                rate = done / elapsed
+                remain = n - done
+                eta = remain / max(rate, 1e-9)
+                print(f"  [hb] {name}: {done:,}/{n:,}  ({done*100.0/n:.1f}%)  "
+                      f"{rate:.1f} win/s  ETA {eta/60:.1f} min")
+                last_hb_t = now
+                last_i = i
 
-def load_dataset_frame() -> pd.DataFrame:
-    if os.path.exists(CFG.PARQUET_PATH):
-        df = pd.read_parquet(CFG.PARQUET_PATH)
-    elif os.path.exists(CFG.CSV_FALLBACK):
-        df = pd.read_csv(CFG.CSV_FALLBACK)
-    else:
-        raise FileNotFoundError(
-            f"Nem {CFG.PARQUET_PATH} nem {CFG.CSV_FALLBACK} existem."
-        )
-    df = _standardize_columns(df)
-    df = _ensure_subset(df)
-    # manter só colunas necessárias
-    keep_cols = ["subset", "file_id", "start_gps", "label"]
-    extra = [c for c in keep_cols if c not in df.columns]
-    if extra:
-        raise KeyError(f"faltando colunas após normalização: {extra}")
-    return df[keep_cols].copy()
+    elapsed = time.time() - t0
+    print(f"      {name} tempo={elapsed:.2f}s | {n:,} janelas | {n/max(elapsed,1e-9):.1f} win/s")
+    return scores
 
 # -----------------------------------
 # MAIN
 # -----------------------------------
 def main():
-    t0 = time.time()
-
+    run_t0 = time.time()
     tag = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(CFG.OUT_DIR_ROOT, tag)
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1) Carregar dataset (robusto)
-    df = load_dataset_frame()
+    # 1) Dataset
+    df = pd.read_parquet(CFG.PARQUET_PATH)
+    if "subset" not in df.columns:
+        # compat: tentar flags antigas
+        if {"is_val","is_test"}.issubset(df.columns):
+            df = df.copy()
+            conds = np.full(len(df), "train", dtype=object)
+            conds[df["is_val"].astype(bool).values] = "val"
+            conds[df["is_test"].astype(bool).values] = "test"
+            df["subset"] = pd.Categorical(conds, categories=["train","val","test"])
+        else:
+            raise KeyError("dataset.parquet sem coluna 'subset'. Recrie com dataset_builder.py atualizado.")
+
     keep = df["subset"].isin(CFG.SUBSETS)
-    df = df.loc[keep].copy()
+    df = df.loc[keep, ["subset", "file_id", "start_gps", "label"]].copy()
 
+    df_val  = df[df["subset"]=="val"].copy()
+    df_test = df[df["subset"]=="test"].copy()
     if CFG.MAX_VAL_ROWS:
-        df_val = df[df["subset"]=="val"].head(CFG.MAX_VAL_ROWS).copy()
-    else:
-        df_val = df[df["subset"]=="val"].copy()
-
+        df_val = df_val.head(CFG.MAX_VAL_ROWS).copy()
     if CFG.MAX_TEST_ROWS:
-        df_test = df[df["subset"]=="test"].head(CFG.MAX_TEST_ROWS).copy()
-    else:
-        df_test = df[df["subset"]=="test"].copy()
+        df_test = df_test.head(CFG.MAX_TEST_ROWS).copy()
 
     print(f"[1/6] Dataset OK: val={len(df_val):,} | test={len(df_test):,}")
 
-    # 2) Banco de templates + cache (por execução)
+    # 2) Banco de templates + cache (por run)
     cache_path = os.path.join(out_dir, CFG.CACHE_FILE)
     bank = build_template_bank(CFG.TEMPLATES_N)
     tmpl_cache = None
@@ -455,68 +453,47 @@ def main():
 
     if tmpl_cache is None:
         print("[2/6] Construindo banco e cache de templates…")
+        print(f"      Total templates: {len(bank)} (IMRPhenomD) em cache")
         tmpl_cache = build_template_cache(bank, CFG.FS_TARGET, CFG.WINDOW_SEC)
-        np.savez(cache_path, keys=np.array(list(tmpl_cache.keys()), dtype=object),
+        np.savez(cache_path,
+                 keys=np.array(list(tmpl_cache.keys()), dtype=object),
                  waves=np.array(list(tmpl_cache.values()), dtype=object))
+    else:
+        print("[2/6] Construindo banco e cache de templates…")
         print(f"      Total templates: {len(tmpl_cache)} (IMRPhenomD) em cache")
 
-    # Self-test rápido
-    def self_test_ncc(cache: Dict[str, np.ndarray]) -> float:
-        if not cache: return 0.0
-        key = next(iter(cache.keys()))
-        hp = cache[key].copy()
-        rng = np.random.default_rng(42)
-        x = hp + 0.3 * rng.standard_normal(hp.size).astype(np.float32)
-        x = (x - x.mean()) / (x.std() + 1e-12)
-        return float(ncc_fft_max(x, hp))
-
+    # Self-test
     val_inj = self_test_ncc(tmpl_cache)
     print("\n[DEBUG] Self-test NCC (injeção sintética) ...")
-    print(f"  NCC(injection): {val_inj:.6f}  (esperado > ~0.05–0.2)")
+    print(f"  NCC(injection): {val_inj:.6f}  (esperado > ~0.05–0.2)\n")
 
-    # 3) Scoring VAL
-    print("\n[3/6] Scoring VAL… (NCC em todos os lags)")
-    t1 = time.time()
-    s_val = np.zeros(len(df_val), np.float32)
-    for i, (fid, sgps) in enumerate(zip(df_val["file_id"].values, df_val["start_gps"].values)):
-        s_val[i] = score_window(fid, float(sgps), tmpl_cache)
-    t2 = time.time()
-    print(f"      tempo={t2-t1:.2f}s | {len(df_val):,} janelas")
-    print(f"      val score stats: min={s_val.min():.3g} med={np.median(s_val):.3g} max={s_val.max():.3g}")
+    # 3) Scoring VAL (com feedback real)
+    s_val = score_subset("VAL", df_val, tmpl_cache)
 
-    # 4) Thresholds pelo VAL
+    # 4) Thresholds
     print("\n[4/6] Thresholds no VAL…")
     y_val = df_val["label"].to_numpy(int)
     thr, info = pick_threshold(y_val, s_val)
-
-    df_val_out = df_val.copy()
-    df_val_out["score"] = s_val
+    df_val_out = df_val.copy(); df_val_out["score"] = s_val
     df_val_out.to_csv(os.path.join(out_dir, "scores_val.csv"), index=False)
     auc_val, ap_val = summarize_and_plot(y_val, s_val, out_dir, prefix="val")
-    print(f"      thr={thr:.6g}  mode={info.get('mode','?')}")
+    print(f"      thr={thr:.6g}  mode={info.get('mode','?')}  info={{k: v for k,v in info.items() if k!='mode'}}")
 
     # 5) Scoring TEST
     print("\n[5/6] Scoring TEST…")
-    s_test = np.zeros(len(df_test), np.float32)
-    for i, (fid, sgps) in enumerate(zip(df_test["file_id"].values, df_test["start_gps"].values)):
-        s_test[i] = score_window(fid, float(sgps), tmpl_cache)
-
-    df_test_out = df_test.copy()
-    df_test_out["score"] = s_test
+    s_test = score_subset("TEST", df_test, tmpl_cache)
+    df_test_out = df_test.copy(); df_test_out["score"] = s_test
     df_test_out.to_csv(os.path.join(out_dir, "scores_test.csv"), index=False)
-    auc_test, ap_test = summarize_and_plot(df_test_out["label"].to_numpy(int),
-                                           df_test_out["score"].to_numpy(float),
-                                           out_dir, prefix="test")
+    y_test = df_test_out["label"].to_numpy(int)
+    auc_test, ap_test = summarize_and_plot(y_test, s_test, out_dir, prefix="test")
 
     # 6) Relatório final
     print("\n[6/6] Salvando relatório…")
-    y_test = df_test_out["label"].to_numpy(int)
     tn, fp, fn, tp = confusion_at_threshold(y_test, s_test, thr)
-
     summary = {
-        "templates": len(tmpl_cache),
-        "fs_target": CFG.FS_TARGET,
-        "window_sec": CFG.WINDOW_SEC,
+        "templates": int(len(tmpl_cache)),
+        "fs_target": int(CFG.FS_TARGET),
+        "window_sec": float(CFG.WINDOW_SEC),
         "auc_val": float(auc_val),
         "ap_val": float(ap_val),
         "auc_test": float(auc_test),
@@ -539,7 +516,7 @@ def main():
     print(f" Test AUC: {auc_test:.3g} | Test AP: {ap_test}")
     print(f" Confusion (test): tn={tn} fp={fp} fn={fn} tp={tp}")
     print(f" Threshold usado: {thr:.6g} ({CFG.MODE})")
-    print(f" Tempo total: {time.time()-t0:.3f} s")
+    print(f" Tempo total: {time.time()-run_t0:.3f} s")
 
 if __name__ == "__main__":
     main()
