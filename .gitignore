@@ -1,2 +1,27 @@
-./venv/ 
-./data
+# Ambiente virtual
+venv/
+.env
+*.env
+
+# Dados
+data/
+*.hdf5
+*.h5
+*.csv
+*.npz
+*.pth
+*.ckpt
+
+# Caches e temporários
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.DS_Store
+
+# IDEs e configs locais
+.vscode/
+.idea/
+.ipynb_checkpoints/
