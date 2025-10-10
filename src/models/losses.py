@@ -1,0 +1,1 @@
+# Funções de perda físicas 

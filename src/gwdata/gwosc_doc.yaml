@@ -1,0 +1,20 @@
+GW150914_raw_data:
+  detectors:
+    - H1
+    - L1
+  description: >
+    Sinais de strain observados pelos interferômetros LIGO Hanford (H1)
+    e LIGO Livingston (L1) durante o evento GW150914, primeiro registro
+    direto de ondas gravitacionais, publicado em 2016.
+  format: HDF5
+  duration_seconds: 4096
+  sampling_rate_hz: 4096
+  keys:
+    - /strain/Strain
+    - /meta/Description
+    - /quality/injections
+  attributes:
+    Xspacing: Intervalo temporal entre amostras (~0.000244 s)
+    Xstart: Tempo GPS do início da janela
+    Detector: Nome do detector (H1 ou L1)
+  next_step: Aplicar bandpass [35–350 Hz] e whitening para remoção de ruído.
