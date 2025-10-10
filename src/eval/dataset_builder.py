@@ -1,17 +1,17 @@
+# src/eval/dataset_builder.py
 """
-dataset_builder.py (rev A)
---------------------------
-Gera dataset rotulado a partir de *_windows.hdf5:
+Gera dataset rotulado a partir de *_windows.hdf5.
 
-- Lê data/processed/*_windows.hdf5
-- Busca 'tc' (tempo de coalescência) no GWOSC API v2 com ?include-default-parameters
-  + cache local com TTL
-- Rotula janelas: label=1 se [start_gps, end_gps] intersecta [tc - pre, tc + pos]
-  * Se existir event_hint (ex.: "GW150914"), usa diretamente.
-  * Senão, faz matching POR ARQUIVO: encontra todos os tc que caem no range GPS
-    desse arquivo e marca as janelas que intersectam cada tc.
-- Split por GRUPO (evento quando houver hint, senão file_id) — evita leakage.
-- Salva Parquet otimizado + CSV preview + meta.json.
+Pipeline:
+1) Lê data/processed/*_windows.hdf5 (metadados + índices de janelas)
+2) Busca mapa {EVENTO -> tc_gps} no GWOSC API v2 (com cache local)
+3) Rotula janela como label=1 se [start_gps, end_gps] intersecta [tc - pre, tc + pos]
+   - Se existir event_hint (ex.: "GW150914"), usa diretamente esse evento.
+   - Senão, faz matching POR ARQUIVO: pega todos os t_c que caem no range GPS
+     coberto pelo arquivo e marca as janelas que intersectam cada t_c.
+4) Faz split por GRUPO (evento quando houver hint, senão file_id) em train/val/test
+   para evitar leakage entre subsets.
+5) Salva Parquet otimizado + CSV preview + meta.json.
 
 Requisitos:
   pip install pandas numpy h5py requests scikit-learn pyarrow tqdm
@@ -45,15 +45,15 @@ class Cfg:
     OUT_PREVIEW: str = os.path.join("data", "processed", "dataset_preview.csv")
     META_JSON: str = os.path.join("data", "processed", "dataset_meta.json")
 
-    # Margem ao redor do tc
+    # Margem temporal ao redor do tc para considerar uma janela positiva
     T_MARGIN_PRE: float = 2.0
     T_MARGIN_POS: float = 2.0
 
-    # Splits
+    # Splits (por grupo: evento ou arquivo)
     TEST_SIZE: float = 0.15
-    VAL_SIZE: float = 0.15  # do restante após tirar test
+    VAL_SIZE: float = 0.15  # do restante após remover TEST
 
-    # Cache de tc
+    # Cache (event-versions -> tc)
     EV2TC_CACHE: str = os.path.join("data", "processed", "_cache_ev2tc.json")
     EV2TC_TTL_DAYS: int = 7
 
@@ -67,8 +67,6 @@ class Cfg:
 CFG = Cfg()
 
 GWOSC = "https://gwosc.org"
-# COM include-default-parameters para trazer 'default_parameters' (inclui tc)
-EVENTS_API = f"{GWOSC}/api/v2/event-versions?include-default-parameters"
 
 # =========================
 # LOGGING
@@ -133,9 +131,8 @@ def _is_cache_fresh(path: str, ttl_days: int) -> bool:
         return False
 
 # =========================
-# Buscar tc
+# Buscar tc no GWOSC API v2 (com cache)
 # =========================
-
 def fetch_event_coalescence_map() -> Dict[str, float]:
     """
     Retorna {EVENTO: gps_coalescencia} usando a API v2:
@@ -165,9 +162,7 @@ def fetch_event_coalescence_map() -> Dict[str, float]:
             if name is not None and gps is not None:
                 ev2tc[str(name).upper()] = float(gps)
 
-        # seguir paginação
-        nxt = page.get("next")
-        url = nxt if nxt else None
+        url = page.get("next") or None
 
     # cache
     try:
@@ -196,6 +191,7 @@ def load_windows_h5(path: str) -> pd.DataFrame:
         window_sec = float(attrs.get("window_sec", 2.0))
         stride_sec = float(attrs.get("stride_sec", 0.5))
         source_file = str(attrs.get("source_file", os.path.basename(path)))
+
         g = f["windows"]
         start_idx = g["start_idx"][()]
         start_gps = g["start_gps"][()]
@@ -268,7 +264,6 @@ def label_windows(df: pd.DataFrame, ev2tc: Dict[str, float],
             tcs = [tc for tc in ev2tc.values() if lo_all <= tc <= hi_all]
             if not tcs:
                 continue
-            # marque janelas que intersectam CADA tc
             starts = sub["start_gps"].to_numpy()
             ends   = sub["end_gps"].to_numpy()
             indices = sub.index.to_numpy()
@@ -281,7 +276,7 @@ def label_windows(df: pd.DataFrame, ev2tc: Dict[str, float],
     return df
 
 # =========================
-# Split por grupo (evento ou arquivo)
+# Split por grupo (evento ou arquivo) -> coluna 'subset'
 # =========================
 def make_group_splits(df: pd.DataFrame,
                       test_size: float, val_size: float,
@@ -298,28 +293,30 @@ def make_group_splits(df: pd.DataFrame,
     idx_all = np.arange(len(df))
     groups_all = df["group_id"].astype(str).to_numpy()
 
-    # test
+    # 1) TEST
     trv_idx, te_idx = _split_by_group(idx_all, groups_all, test_size, seed)
     train_val = df.iloc[trv_idx].copy()
-    test = df.iloc[te_idx].copy(); test["split"] = "test"
+    test = df.iloc[te_idx].copy(); test["subset"] = "test"
 
-    # val do restante
-    rel_val = val_size / (1.0 - test_size)
+    # 2) VAL do restante
+    rel_val = val_size / (1.0 - test_size + 1e-12)
     idx_trv = np.arange(len(train_val))
     groups_trv = train_val["group_id"].astype(str).to_numpy()
     tr_idx, va_idx = _split_by_group(idx_trv, groups_trv, rel_val, seed + 1)
-    train = train_val.iloc[tr_idx].copy(); train["split"] = "train"
-    val   = train_val.iloc[va_idx].copy(); val["split"]   = "val"
+    train = train_val.iloc[tr_idx].copy(); train["subset"] = "train"
+    val   = train_val.iloc[va_idx].copy(); val["subset"]   = "val"
 
     out = pd.concat([train, val, test], ignore_index=True)
+    out["subset"] = out["subset"].astype("category")
+
     # log distribuição
     for tag, part in (("TRAIN", train), ("VAL", val), ("TEST", test)):
         posp = 100.0 * float(part["label"].sum()) / max(len(part), 1)
         log.info(f"{tag}: n={len(part):,} | pos%={posp:.2f}")
-    return out
+    return out.drop(columns=["group_id"])
 
 # =========================
-# Escrita Parquet incremental
+# Escrita Parquet
 # =========================
 def write_parquet(df: pd.DataFrame, out_path: str, compression: str, rowgroup_size: int) -> None:
     import pyarrow as pa
@@ -329,12 +326,11 @@ def write_parquet(df: pd.DataFrame, out_path: str, compression: str, rowgroup_si
 
     # dtypes otimizados
     df = df.copy()
-    for col in ("detector", "event_hint", "split"):
+    for col in ("detector", "event_hint", "subset"):
         if col in df:
             df[col] = df[col].astype("category")
-    for col in ("label",):
-        if col in df:
-            df[col] = df[col].astype(np.uint8)
+    if "label" in df:
+        df["label"] = df["label"].astype(np.uint8)
     for col in ("fs", "window_sec", "stride_sec", "snr_rms", "snr_peak", "crest_factor"):
         if col in df:
             df[col] = df[col].astype(np.float32)
@@ -347,6 +343,8 @@ def write_parquet(df: pd.DataFrame, out_path: str, compression: str, rowgroup_si
         use_dictionary=True,
         data_page_size=None,
         write_statistics=True
+        # Nota: rowgroup_size não é parâmetro direto do write_table; se quiser
+        # controlar, use um writer explícito com chunks. Para simplicidade, omitimos.
     )
     log.info(f"Parquet escrito: {out_path} (linhas: {len(df):,})")
 
@@ -356,18 +354,18 @@ def write_parquet(df: pd.DataFrame, out_path: str, compression: str, rowgroup_si
 def main():
     os.makedirs(CFG.PROCESSED_DIR, exist_ok=True)
 
-    # 1) caminhos
+    # 1) localizar janelas
     paths = sorted(glob.glob(os.path.join(CFG.PROCESSED_DIR, "*_windows.hdf5")))
     if not paths:
         log.error("Nenhum *_windows.hdf5 em data/processed/. Rode seu run_gwosc.py com ENABLE_WINDOWS=True.")
         return
     log.info(f"Arquivos de janelas encontrados: {len(paths)}")
 
-    # 2) tc (com cache + include-default-parameters)
+    # 2) mapa de t_c (com cache)
     ev2tc = fetch_event_coalescence_map()
     log.info(f"Eventos com tc disponíveis: {len(ev2tc)}")
 
-    # 3) ler e rotular por arquivo
+    # 3) ler + rotular por arquivo
     frames: List[pd.DataFrame] = []
     for p in tqdm(paths, desc="Lendo/rotulando", unit="file"):
         try:
@@ -387,7 +385,7 @@ def main():
 
     df_all = pd.concat(frames, ignore_index=True)
 
-    # 4) splits por grupo
+    # 4) splits por grupo -> coluna 'subset'
     df_all = make_group_splits(
         df_all,
         test_size=CFG.TEST_SIZE,
@@ -395,21 +393,25 @@ def main():
         seed=42
     )
 
-    # 5) colunas finais
+    # 5) colunas finais (incluir 'subset' para consumo pelo mf_baseline)
     keep_cols = [
         "file_id", "source_file", "event_hint", "detector",
         "fs", "start_gps", "end_gps", "start_idx",
         "window_sec", "stride_sec",
         "snr_rms", "snr_peak", "crest_factor",
-        "label", "split"
+        "label", "subset"
     ]
+    missing = [c for c in keep_cols if c not in df_all.columns]
+    if missing:
+        raise RuntimeError(f"Faltando colunas no dataset final: {missing}")
+
     df_all = df_all[keep_cols].copy()
 
-    # preview
+    # 6) preview
     df_all.head(2000).to_csv(CFG.OUT_PREVIEW, index=False)
     log.info(f"Preview salvo: {CFG.OUT_PREVIEW}")
 
-    # 6) parquet
+    # 7) parquet
     write_parquet(
         df=df_all,
         out_path=CFG.OUT_PARQUET,
@@ -417,7 +419,7 @@ def main():
         rowgroup_size=CFG.PARQUET_ROWGROUP_SIZE
     )
 
-    # 7) meta
+    # 8) meta.json
     meta = {
         "t_margin_pre": CFG.T_MARGIN_PRE,
         "t_margin_pos": CFG.T_MARGIN_POS,
@@ -432,7 +434,7 @@ def main():
         json.dump(meta, f, indent=2)
     log.info(f"Meta salvo: {CFG.META_JSON}")
 
-    # resumo
+    # 9) resumo
     tot = len(df_all)
     pos = int(df_all["label"].sum())
     log.info("===== RESUMO DATASET =====")

@@ -1,0 +1,35 @@
+{
+  "templates": 256,
+  "fs_target": 4096,
+  "val": {
+    "auc": 0.5,
+    "ap": 0.001465380388325803
+  },
+  "test": {
+    "auc": 0.5,
+    "ap": 0.0014959091464159238,
+    "threshold": 0.0,
+    "confusion": {
+      "tn": 0,
+      "fp": 32707,
+      "fn": 0,
+      "tp": 49
+    }
+  },
+  "self_test_ncc": 7.957789158533068e-13,
+  "cfg": {
+    "WINDOWS_DIR": "data/processed/windows",
+    "INTERIM_DIR": "data/interim",
+    "DATASET_PARQUET": "data/processed/dataset.parquet",
+    "DATASET_META": "data/processed/dataset_meta.json",
+    "FS_TARGET": 4096,
+    "WINDOW_SEC": 2.0,
+    "BANK_N": 256,
+    "F_LOWER": 20.0,
+    "TAPER_ALPHA": 0.05,
+    "N_JIT_PREVIEW": 3,
+    "THRESH_MODE": "target_far",
+    "TARGET_FAR": 1e-06,
+    "OUT_DIR": "reports/mf_baseline"
+  }
+}

@@ -144,7 +144,6 @@ def _snr_rms(win: np.ndarray) -> float:
 def _snr_peak(win: np.ndarray) -> float:
     return float(np.max(np.abs(win)))
 
-
 def process_whitened_file(
     in_path: str,
     out_dir: str,
@@ -152,114 +151,81 @@ def process_whitened_file(
     stride_sec: float = 0.5,
     snr_threshold: Optional[float] = None,
     save_windows: bool = False,
-    windows_dtype: str = "float32",   # 'float32' ou 'float16'
     compress_level: int = 4,
 ) -> Optional[str]:
-    """
-    Gera janelas e salva métricas SNR. Se snr_threshold for definido, salva
-    apenas janelas acima do limiar (tanto nas métricas quanto nos dados).
-
-    Retorna o caminho do HDF5 de saída (mesmo se não houver janelas; meta é gravada).
-    """
     os.makedirs(out_dir, exist_ok=True)
     x, fs, meta = _load_whitened(in_path)
     n = len(x)
 
     base = os.path.basename(in_path).replace("_whitened.hdf5", "")
-    if base == os.path.basename(in_path):
-        # caso o arquivo não siga o sufixo _whitened.hdf5, ainda geramos nome claro
-        base = os.path.splitext(os.path.basename(in_path))[0]
     out_name = f"{base}_windows.hdf5"
     out_path = os.path.join(out_dir, out_name)
 
-    starts: List[int] = []
-    snr_rms_list: List[float] = []
-    snr_peak_list: List[float] = []
-    selected_windows: List[np.ndarray] = []
+    # NEW: source_path relativo (do processed -> interim)
+    # Se processed e interim estão no mesmo nível de data/, usar caminho relativo:
+    try:
+        rel_source = os.path.relpath(in_path, start=os.path.dirname(out_path))
+    except Exception:
+        rel_source = os.path.basename(in_path)
 
-    gps0 = float(meta.get("xstart", meta.get("Xstart", 0.0)))
-    # prioridade ao attr; se não há xspacing, usa 1/fs
-    dt = float(meta.get("xspacing", meta.get("Xspacing", 1.0 / fs)))
+    starts, snr_rms_list, snr_peak_list = [], [], []
+    selected_windows = []
 
-    wlen = int(round(window_sec * fs))
+    # tempo GPS (aprox) por índice, se disponível:
+    gps0 = float(meta.get("xstart", 0.0))
+    dt   = float(meta.get("xspacing", 1.0 / fs))
 
     for i0, i1 in tqdm(_frame_indices(n, fs, window_sec, stride_sec),
                        desc=f"Janelando {base}", unit="win"):
         win = x[i0:i1]
-        # segurança: pode acontecer de o último frame sair com tamanho errado
-        if win.shape[0] != wlen:
-            continue
-
         r = _snr_rms(win)
         p = _snr_peak(win)
 
-        if (snr_threshold is not None) and (max(r, p) < snr_threshold):
+        if snr_threshold is not None and max(r, p) < snr_threshold:
             continue
 
         starts.append(i0)
         snr_rms_list.append(r)
         snr_peak_list.append(p)
-
         if save_windows:
-            if windows_dtype == "float16":
-                selected_windows.append(win.astype(np.float16, copy=False))
-            else:
-                selected_windows.append(win.astype(np.float32, copy=False))
+            selected_windows.append(win.copy())
 
-    # Escrita do HDF5
     with h5py.File(out_path, "w") as f:
-        f.attrs["fs"] = fs
-        f.attrs["window_sec"] = window_sec
-        f.attrs["stride_sec"] = stride_sec
-        f.attrs["source_file"] = os.path.basename(in_path)  # importante p/ baseline reconstruir janelas
+        # Atributos de alto nível (redundantes, mas úteis)
+        f.attrs["fs"] = float(fs)
+        f.attrs["window_sec"] = float(window_sec)
+        f.attrs["stride_sec"] = float(stride_sec)
+        f.attrs["source_file"] = os.path.basename(in_path)
 
-        # meta de entrada para facilitar *downstream*
+        # NEW: meta_in SEMPRE presente, com ponteiros mínimos
         m = f.create_group("meta_in")
-        # sempre registre caminho de origem (relativo) – facilita reabrir o whitened
-        try:
-            rel_src = os.path.relpath(in_path, start=os.path.dirname(out_path))
-        except Exception:
-            rel_src = in_path
-        m.attrs["source_path"] = rel_src
-        # copia attrs conhecidos
-        for k, v in meta.items():
-            # garante tipos simples
-            if isinstance(v, (np.integer, np.floating)):
-                v = v.item()
-            m.attrs[str(k)] = v
+        m.attrs["source_path"] = rel_source  # <<< ESSENCIAL
+        # propague o que tiver do whitened
+        if "xstart" in meta:   m.attrs["xstart"]   = float(meta["xstart"])
+        if "xspacing" in meta: m.attrs["xspacing"] = float(meta["xspacing"])
+        # redundância útil:
+        m.attrs["fs"] = float(fs)
 
-        g = f.create_group("windows")
-        if len(starts) > 0:
-            starts_arr = np.asarray(starts, dtype=np.int64)
-            start_gps = gps0 + starts_arr * dt
-            g.create_dataset("start_idx", data=starts_arr, dtype="i8",
-                             compression="gzip", compression_opts=compress_level)
-            g.create_dataset("start_gps", data=start_gps.astype(np.float64), dtype="f8",
-                             compression="gzip", compression_opts=compress_level)
-            g.create_dataset("snr_rms", data=np.asarray(snr_rms_list, dtype=np.float32), dtype="f4",
-                             compression="gzip", compression_opts=compress_level)
-            g.create_dataset("snr_peak", data=np.asarray(snr_peak_list, dtype=np.float32), dtype="f4",
-                             compression="gzip", compression_opts=compress_level)
+        # datasets de janelas
+        if starts:
+            starts = np.asarray(starts, dtype=np.int64)
+            snr_rms_arr  = np.asarray(snr_rms_list, dtype=np.float32)
+            snr_peak_arr = np.asarray(snr_peak_list, dtype=np.float32)
+            start_gps    = gps0 + starts * dt
 
-            if save_windows:
-                W = np.vstack(selected_windows)  # (N, T)
-                # chunking razoável: linhas pequenas para leitura eficiente
-                nrows = W.shape[0]
-                row_chunk = min(256, nrows)
-                chunks = (row_chunk, min(W.shape[1], 8192))
-                g.create_dataset("data", data=W,
-                                 dtype=("f2" if windows_dtype == "float16" else "f4"),
-                                 compression="gzip", compression_opts=compress_level,
-                                 chunks=chunks)
-        else:
-            # cria dsets vazios com tamanho 0 (consistente p/ downstream)
-            g.create_dataset("start_idx", data=np.zeros((0,), dtype=np.int64))
-            g.create_dataset("start_gps", data=np.zeros((0,), dtype=np.float64))
-            g.create_dataset("snr_rms", data=np.zeros((0,), dtype=np.float32))
-            g.create_dataset("snr_peak", data=np.zeros((0,), dtype=np.float32))
-            # não cria "/windows/data" sem janelas
+            g = f.create_group("windows")
+            g.create_dataset("start_idx", data=starts, dtype="i8", compression="gzip", compression_opts=compress_level)
+            g.create_dataset("start_gps", data=start_gps.astype(np.float64), dtype="f8", compression="gzip", compression_opts=compress_level)
+            g.create_dataset("snr_rms",   data=snr_rms_arr, dtype="f4", compression="gzip", compression_opts=compress_level)
+            g.create_dataset("snr_peak",  data=snr_peak_arr, dtype="f4", compression="gzip", compression_opts=compress_level)
+
+            if save_windows and selected_windows:
+                W = np.vstack(selected_windows).astype(np.float32)
+                g.create_dataset("data", data=W, dtype="f4", compression="gzip", compression_opts=compress_level)
+        # se não houver starts, ainda assim deixamos meta_in gravado
 
     return out_path
+
 
 
 # ---------- Helper opcional para processar diretórios ----------
