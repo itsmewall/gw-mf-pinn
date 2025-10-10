@@ -1,0 +1,234 @@
+gw-mf-pinn:
+  overview:
+    purpose: >
+      Pipeline para coleta e pré-processamento de sinais de ondas gravitacionais
+      (GW) do GWOSC, com foco em uma “análise inicial” leve (≤10 GB por rodada),
+      e capacidade de escalar para conjuntos maiores ajustando variáveis no run.py.
+    design:
+      - Sem argumentos de linha de comando; basta executar `python src/run.py`.
+      - Execução idempotente: arquivos já existentes são pulados.
+      - Estruturado por estágios: download → pré-processamento (whitening) → (opcional) janelamento/SNR.
+      - Logs persistentes em logs/pipeline.log.
+    directories:
+      raw: data/raw            # arquivos originais do GWOSC (HDF5/GWF)
+      interim: data/interim    # sinais whitened (HDF5) com metadados
+      processed: data/processed # (opcional) janelas/SNR/labels para treino
+      configs: configs         # YAMLs de parâmetros (opcional)
+      logs: logs               # logs de execução
+      notebooks: notebooks     # exploração e visualização
+    execution:
+      command: "python src/run.py"
+      stop_safely: >
+        Crie um arquivo vazio chamado 'STOP' na raiz do projeto para interromper
+        downloads com segurança; o pipeline finaliza o arquivo corrente e encerra.
+
+  data_source:
+    gwosc:
+      api_version: v2
+      base_url: "https://gwosc.org"
+      endpoints:
+        runs: "/api/v2/runs"
+        events: "/api/v2/event-versions"
+        event_strain_files: "/api/v2/events/<EVENT>/strain-files"
+      pagination_and_throttling:
+        pagination: true
+        notes: >
+          Endpoints retornam 'results' + 'next'. O pipeline segue a paginação automaticamente.
+        courteous_delay_ms: 150
+      auth: "Não requer autenticação (público)."
+      format: "JSON, com links diretos para arquivos HDF5/GWF."
+
+  gw_files:
+    formats:
+      - name: HDF5
+        ext: ".hdf5"
+        preferred: true
+        reason: "Leitura direta via h5py; estrutura clara de grupos/atributos."
+      - name: GWF
+        ext: ".gwf"
+        preferred: false
+        reason: "Formato de frames; útil para pipelines específicos (não necessário aqui)."
+    detectors:
+      - code: H1
+        site: "LIGO Hanford (WA, EUA)"
+      - code: L1
+        site: "LIGO Livingston (LA, EUA)"
+      - code: V1
+        site: "Virgo (Cascina, Itália)"
+    sample_rates:
+      - rate_hz: 4096
+        label: "4 kHz"
+        usage: "Preferido para análise inicial (menor e suficiente para primeiros estudos)."
+      - rate_hz: 16384
+        label: "16 kHz"
+        usage: "Mais pesado; útil para análises de alta frequência."
+    durations:
+      - seconds: 4096
+        usage: "Preferido para PSD estável e janelas amplas."
+      - seconds: 32
+        usage: "Curto; bom para demonstrações ou recortes do evento."
+      - seconds: 128
+        usage: "Equilíbrio entre tamanho e contexto."
+    releases_and_labels:
+      examples:
+        - "LOSC/GWOSC: rótulos históricos/organização de catálogo (R1, R2, ...)."
+      note: "Múltiplas versões de um mesmo evento podem existir (refinos, reorganização)."
+    typical_filename_pattern:
+      example: "H-H1_GWOSC_4KHZ_R1-1126257414-4096.hdf5"
+      tokens:
+        - "H-H1 / L-L1 / V-V1 → detector"
+        - "GWOSC / LOSC → catálogo/release"
+        - "4KHZ / 16KHZ → taxa de amostragem"
+        - "R1 / R2 → revisão/liberação"
+        - "<GPS_start> → tempo inicial GPS"
+        - "4096 → duração (s)"
+    hdf5_structure_common:
+      strain_dataset: "/strain/Strain"
+      attributes:
+        Xspacing: "Intervalo entre amostras (dt), p.ex. 1/4096 s"
+        Xstart: "Tempo GPS de início"
+        Units: "Unidades (geralmente 'strain')"
+        Detector: "Nome do detector (H1/L1/V1)"
+      other_groups_may_include:
+        - "/meta/*"
+        - "/quality/*"
+      integrity_check: "Abrir com h5py e listar chaves; opcionalmente calcular SHA para rastreabilidade."
+
+  run_behavior:
+    profiles_and_limits:
+      profile_variable: "PROFILE  # 'initial' | 'extended' | 'full'"
+      initial:
+        max_download_bytes_per_run: "≈ 10 GB"
+        max_events_per_run: 20
+        max_files_per_event: 2
+        max_single_file_bytes: "1 GB"
+        goal: "Amostra reduzida e suficiente para pipeline inicial."
+      extended:
+        max_download_bytes_per_run: "≈ 50 GB"
+        max_events_per_run: 100
+        max_files_per_event: 4
+        max_single_file_bytes: "2 GB"
+        goal: "Expansão gradual com mais cobertura."
+      full:
+        max_download_bytes_per_run: "≈ 500 GB"
+        max_events_per_run: 10000
+        max_files_per_event: 100
+        max_single_file_bytes: "8 GB"
+        goal: "Coleta ampla (cuidado com armazenamento)."
+    selection_filters:
+      preferred_format: "HDF5"
+      prefer_4khz: true
+      prefer_4096s: true
+      allowed_detectors: ["H1", "L1"]  # adicione "V1" quando quiser incluir Virgo
+    idempotency:
+      download: "Se o arquivo já existe em data/raw, é pulado."
+      preprocess: "Se *_whitened.hdf5 já existe em data/interim, é pulado."
+    safety:
+      stop_sentinel_file: "STOP"
+      disk_free_reserve: "≥ 2 GB livres antes de baixar"
+      head_check: "HEAD request para estimar Content-Length (quando possível)."
+
+  preprocessing:
+    stage: "Bandpass + Notch + PSD (Welch) + Whitening"
+    module: "src/gwdata/preprocess.py"
+    parameters:
+      bandpass:
+        lowcut_hz: 35.0
+        highcut_hz: 350.0
+        filter_order: 6
+        method: "Butterworth + filtfilt (zero-phase)"
+      notch:
+        base_hz: 60.0
+        harmonics: 0  # use 5 para 60/120/180/240/300 Hz (ambiente Brasil)
+        q_factor: 30.0
+      psd:
+        welch_segment_sec: 4.0
+        overlap_fraction: 0.5
+        notes: "Garante PSD estável em janelas de 4096 s."
+      whitening:
+        method: "X(f) / sqrt(PSD(f)/2) com interpolação para grade da FFT"
+    outputs:
+      dataset: "/strain/StrainWhitened"
+      attributes:
+        fs: "Taxa de amostragem (Hz)"
+        bandpass_low: "Lowcut (Hz)"
+        bandpass_high: "Highcut (Hz)"
+        notch_base: "Frequência base da notch (Hz)"
+        notch_harmonics: "Número de harmônicos"
+      meta_copy: "Atributos de entrada (Detector, Xspacing, Xstart, Units, length) são preservados no grupo /meta."
+    file_naming:
+      input: "*.hdf5  # ex.: H-H1_GWOSC_4KHZ_R1-1126257414-4096.hdf5"
+      output: "*_whitened.hdf5  # ex.: H-H1_GWOSC_4KHZ_R1-1126257414-4096_whitened.hdf5"
+
+  artifacts_and_sizes:
+    typical_sizes:
+      raw_4khz_4096s_single_detector: "~ 120–150 MiB"
+      two_detectors_per_event: "~ 240–300 MiB"
+      whitened_artifact: "~ 50–75% do original (depende dos dados e compressão HDF5)"
+    footprint_estimation:
+      initial_run_rough: "≈ 10 GB baixados + ≈ 5–7 GB interim (estimativa)"
+    retention_recommendation:
+      keep:
+        - "HDF5 4kHz 4096s (H1/L1)"
+        - "Whitened correspondentes"
+      optional_delete:
+        - "Arquivos 16 kHz e janelas mais longas/curtas duplicadas"
+        - "GWF (se não for usar)"
+      rationale: "Maximiza utilidade por GB e simplifica o pipeline."
+
+  extension_plan:
+    to_scale_up:
+      - "Mudar PROFILE para 'extended' ou 'full'."
+      - "Adicionar 'V1' em allowed_detectors."
+      - "Desativar prefer_4khz/prefer_4096s para baixar 16 kHz e outras durações."
+      - "Aumentar max_download_bytes_per_run e max_events_per_run."
+    next_pipeline_stage:
+      windows_snr:
+        purpose: "Gerar janelas deslizantes com SNR e rótulos (positivas/negativas)."
+        output: "HDF5 ou parquet/npz em data/processed/"
+        parameters_example:
+          window_sec: 2.0
+          stride_sec: 0.5
+          snr_threshold: null  # ou ex.: 8.0
+        note: "Integra-se com treino de PINN/MF-PINN/CNN."
+    cplusplus_acceleration:
+      approach: "pybind11 para kernels de física/simulação pesada."
+      when: "Após pipeline estável e métricas de gargalo identificadas."
+
+  troubleshooting:
+    venv_missing:
+      symptom: "bash: venv/bin/python: No such file or directory"
+      fix:
+        - "rm -rf venv"
+        - "python3 -m venv venv && source venv/bin/activate"
+    conda_not_found:
+      symptom: "'conda' não é reconhecido"
+      fix: "Instalar Anaconda/Miniconda e adicionar Scripts/Library/bin ao PATH do usuário."
+    huge_download:
+      cause: "Múltiplos formatos/taxas/durações por evento."
+      quick_fixes:
+        - "Usar PROFILE='initial'."
+        - "Manter preferências HDF5/4kHz/4096s + allowed_detectors=['H1','L1']."
+        - "Reduzir max_events_per_run e max_files_per_event."
+    api_429_or_timeout:
+      cause: "Muitas requisições simultâneas"
+      mitigation:
+        - "Aguardar e reexecutar; o pipeline é idempotente."
+        - "Reduzir MAX_EVENTS_PER_RUN; manter delay de cortesia."
+    integrity:
+      check: "Abrir com h5py e listar chaves; usar verify_integrity() (hash + leitura de grupos)."
+
+  acknowledgements_and_license:
+    data_license: "CC BY 4.0 (GWOSC)"
+    acknowledgement_link: "https://gwosc.org"
+    cite_examples:
+      - "Observation of Gravitational Waves from a Binary Black Hole Merger (Abbott et al., 2016)"
+      - "GWOSC: The Gravitational-Wave Open Science Center"
+
+  quick_glossary:
+    strain: "Variação relativa de comprimento nos braços do interferômetro (sinal físico + ruído)."
+    whitening: "Normalização espectral pela PSD para tornar o ruído aproximadamente branco."
+    PSD_Welch: "Estimativa de densidade espectral de potência usando médias de janelas."
+    bandpass: "Filtro passa-faixa para manter a banda de interesse do sinal GW."
+    notch: "Filtros estreitos para remover linhas de rede e harmônicos."
+    GPS_time: "Representação temporal usada nas séries (segundos desde 1980-01-06)."
