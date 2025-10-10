@@ -3,16 +3,14 @@ run.py
 ------
 Motor único SEM ARGUMENTOS.
 
-Fluxo:
-  1) Descobre todos os eventos públicos (API v2 GWOSC, com paginação)
-  2) Para cada evento, lista strain-files e baixa SÓ o que for necessário
-     para a análise inicial (configurável nas variáveis abaixo)
-  3) Pré-processa APENAS os arquivos novos (bandpass + notch + whitening)
-  4) Mostra progresso (tqdm) e salva log em logs/pipeline.log
-  5) Resumo final de quantos arquivos baixou/processou
+Fluxo automático (configurável por toggles):
+  1) (opcional) Descobre eventos públicos e baixa arquivos que faltam
+  2) (opcional) Pré-processa (bandpass + notch + PSD + whitening) só os novos
+  3) (opcional) Gera janelas deslizantes (SNR RMS/Peak) só dos whitened novos
+  4) Resumo final
 
-Requisitos (venv ativo):
-  pip install requests h5py numpy scipy tqdm pyyaml
+Requisitos (venv):
+  pip install requests h5py numpy scipy tqdm pyyaml gwosc
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ import sys
 import re
 import time
 import glob
-import math
 import shutil
 import logging
 from typing import List, Dict, Optional, Tuple
@@ -30,33 +27,41 @@ from urllib.parse import urlparse
 import requests
 from tqdm import tqdm
 
-# Usa o módulo de pré-processamento do projeto
+# --- módulos do projeto ---
 from gwdata import preprocess as pp
+from gwdata.windows import process_whitened_file  # etapa 3: janelas/SNR
 
 
 # =============================================================================
-# PERFIS / LIMITES (EDITE AQUI)
+# TOGGLES — ligue/desligue estágios
 # =============================================================================
-# Perfil padrão de "análise inicial" — ~≤ 10 GB por rodada (ajuste se quiser)
+ENABLE_DOWNLOAD = False     # coloque False para NÃO baixar nada
+ENABLE_WHITEN   = False     # coloque False para NÃO fazer whitening
+ENABLE_WINDOWS  = True     # coloque False para NÃO gerar janelas/SNR
+
+# =============================================================================
+# PERFIS / LIMITES — "initial" ≈ ≤10 GB/rodada
+# =============================================================================
 PROFILE = "initial"     # "initial" | "extended" | "full"
 
 # Diretórios
-DATA_RAW     = "data/raw"
-DATA_INTERIM = "data/interim"
-LOG_DIR      = "logs"
+DATA_RAW       = "data/raw"
+DATA_INTERIM   = "data/interim"
+DATA_PROCESSED = "data/processed"
+LOG_DIR        = "logs"
 
-# Preferências de arquivo (filtros de qualidade/tamanho)
-PREFER_HDF5                = True      # sempre preferir HDF5 (ao invés de GWF)
-PREFER_4KHZ                = True      # preferir taxa 4 kHz (menor e suficiente p/ começo)
-PREFER_DURATION_4096S      = True      # preferir janelas de 4096 s (ótimas p/ PSD)
-ALLOW_DETECTORS            = {"H1", "L1"}  # para começar, só LIGO Hanford/Livingston
+# Preferências de arquivo (qualidade x tamanho)
+PREFER_HDF5           = True
+PREFER_4KHZ           = True
+PREFER_DURATION_4096S = True
+ALLOW_DETECTORS       = {"H1", "L1"}  # adicione "V1" para incluir Virgo
 
-# Limites de download por rodada (orçamento)
+# Limites por perfil
 if PROFILE == "initial":
     MAX_DOWNLOAD_BYTES_PER_RUN = 10 * 1024**3  # 10 GB
-    MAX_EVENTS_PER_RUN         = 20            # baixa no máx. N eventos por execução
-    MAX_FILES_PER_EVENT        = 2             # ~1 por detector (H1 + L1)
-    MAX_SINGLE_FILE_BYTES      = 1 * 1024**3   # 1 GB por arquivo
+    MAX_EVENTS_PER_RUN         = 20
+    MAX_FILES_PER_EVENT        = 2             # tipicamente H1 + L1
+    MAX_SINGLE_FILE_BYTES      = 1 * 1024**3
 elif PROFILE == "extended":
     MAX_DOWNLOAD_BYTES_PER_RUN = 50 * 1024**3
     MAX_EVENTS_PER_RUN         = 100
@@ -68,27 +73,35 @@ else:  # "full"
     MAX_FILES_PER_EVENT        = 100
     MAX_SINGLE_FILE_BYTES      = 8 * 1024**3
 
-# Sentinela para parar com segurança
-STOP_SENTINEL = "STOP"     # se existir um arquivo "STOP" na raiz, downloads param
+# Sentinela de parada segura
+STOP_SENTINEL = "STOP"
 
-# Pré-processamento (ajuste aqui conforme sua necessidade)
+# =============================================================================
+# PARÂMETROS DE PRÉ-PROCESSAMENTO (whitening)
+# =============================================================================
 LOWCUT       = 35.0
 HIGHCUT      = 350.0
 ORDER_BP     = 6
-FS_TARGET    = None        # apenas checagem; sem reamostragem aqui
+FS_TARGET    = None       # só checa; sem reamostragem aqui
 NOTCH_BASE   = 60.0
-NOTCH_HARMS  = 0           # use 5 para remover 60/120/180/240/300 Hz
+NOTCH_HARMS  = 0          # use 5 p/ 60/120/180/240/300 Hz (BR)
 PSD_SEG      = 4.0
 PSD_OVERLAP  = 0.5
 
+# =============================================================================
+# PARÂMETROS DE JANELAMENTO / SNR
+# =============================================================================
+WINDOW_SEC     = 2.0
+STRIDE_SEC     = 0.5
+SNR_THRESHOLD  = None     # ex. 6.0 para manter só janelas "fortes"
+SAVE_WINDOWS   = False    # True salva dados das janelas (pode pesar)
 
 # =============================================================================
 # GWOSC API (v2)
 # =============================================================================
 GWOSC        = "https://gwosc.org"
-EVENTS_API   = f"{GWOSC}/api/v2/event-versions"     # lista eventos (paginado)
+EVENTS_API   = f"{GWOSC}/api/v2/event-versions"     # lista eventos
 STRAIN_API   = f"{GWOSC}/api/v2/events"             # /<event>/strain-files
-
 
 # =============================================================================
 # LOGGING
@@ -97,18 +110,14 @@ def setup_logging() -> logging.Logger:
     os.makedirs(LOG_DIR, exist_ok=True)
     logger = logging.getLogger("run")
     logger.setLevel(logging.INFO)
-
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-
     fh = logging.FileHandler(os.path.join(LOG_DIR, "pipeline.log"), encoding="utf-8")
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-
     logger.handlers[:] = [ch, fh]
     return logger
-
 
 # =============================================================================
 # HELPERS
@@ -117,17 +126,13 @@ def _list_files(pattern: str) -> List[str]:
     return sorted(glob.glob(pattern))
 
 def _basename_from_url(url: str) -> str:
-    path = urlparse(url).path
-    base = os.path.basename(path)
-    return base or "file.hdf5"
+    return os.path.basename(urlparse(url).path) or "file.hdf5"
 
 def _enough_space(path: str, need_bytes: int) -> bool:
     total, used, free = shutil.disk_usage(os.path.abspath(path))
-    # reserva 2 GB livres
-    return free - need_bytes > 2 * 1024**3
+    return free - need_bytes > 2 * 1024**3  # reserva 2 GB
 
 def _match_detector_from_name(fname: str) -> Optional[str]:
-    # padrões comuns: H-H1_..., L-L1_..., V-V1_...
     m = re.match(r"^[A-Z]-([HLV]1)_", os.path.basename(fname))
     return m.group(1) if m else None
 
@@ -135,27 +140,19 @@ def _contains_4khz(fname: str) -> bool:
     return "4KHZ" in os.path.basename(fname).upper()
 
 def _contains_4096s(fname: str) -> bool:
-    # sufixos "-4096.hdf5", "-4096.gwf", etc.
     return "-4096." in os.path.basename(fname)
 
-
 # =============================================================================
-# API v2: listar TODOS os eventos (paginado)
+# API v2: TODOS os eventos (paginado)
 # =============================================================================
 def fetch_all_events() -> List[str]:
-    """
-    Varre /api/v2/event-versions com paginação e retorna nomes (GW150914, ...)
-    Removendo sufixos de versão (-v1, -v2) se houver.
-    """
     logger = logging.getLogger("run")
     events: List[str] = []
-
     url = EVENTS_API
     while url:
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         payload = r.json()
-
         for item in payload.get("results", []):
             name = item.get("name") or item.get("event_name")
             if not name:
@@ -164,44 +161,26 @@ def fetch_all_events() -> List[str]:
                 name = name.split("-v")[0]
             if name not in events:
                 events.append(name)
-
         url = payload.get("next")
-        time.sleep(0.15)  # cortesia com a API
-
+        time.sleep(0.15)
     logger.info(f"Eventos públicos descobertos: {len(events)}")
     return events
 
-
 # =============================================================================
-# API v2: strain-files de um evento
+# API v2: strain-files por evento
 # =============================================================================
 def fetch_strain_files_for_event(event: str) -> List[Dict]:
-    """
-    Retorna itens contendo hdf5_url/gwf_url/detail_url.
-    """
     url = f"{STRAIN_API}/{event}/strain-files"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     payload = r.json()
     return payload.get("results", [])
 
-
 def _choose_url_and_name(item: Dict) -> Optional[Tuple[str, str]]:
-    """
-    Decide a melhor URL e nome do arquivo para baixar, respeitando preferências:
-      - HDF5 > GWF (se PREFER_HDF5)
-      - 4 kHz e 4096 s (se preferido)
-      - Retorna (url, filename)
-    """
-    # candidatos
     url_hdf5 = item.get("hdf5_url")
     url_gwf  = item.get("gwf_url")
     detail   = item.get("detail_url")
-
-    # 1) preferir HDF5 se existir
     url = url_hdf5 if (PREFER_HDF5 and url_hdf5) else (url_hdf5 or url_gwf)
-
-    # 2) se não houver link direto, tentar via detail_url
     if not url and detail:
         try:
             rd = requests.get(detail, timeout=20)
@@ -210,40 +189,22 @@ def _choose_url_and_name(item: Dict) -> Optional[Tuple[str, str]]:
             url = dj.get("hdf5_url") or dj.get("gwf_url")
         except Exception:
             url = None
-
     if not url:
         return None
-
     fname = _basename_from_url(url)
-
-    # filtros 4kHz / 4096 s (apenas se preferido)
     if PREFER_4KHZ and not _contains_4khz(fname):
         return None
     if PREFER_DURATION_4096S and not _contains_4096s(fname):
         return None
-
-    # filtro por detector permitido
     det = _match_detector_from_name(fname)
     if det and ALLOW_DETECTORS and (det not in ALLOW_DETECTORS):
         return None
-
     return url, fname
-
 
 # =============================================================================
 # DOWNLOAD CONTROLADO
 # =============================================================================
-def ensure_event_downloaded(event: str,
-                            out_dir: str,
-                            budget_state: Dict[str, int]) -> int:
-    """
-    Baixa arquivos de um evento respeitando:
-      - MAX_FILES_PER_EVENT
-      - MAX_DOWNLOAD_BYTES_PER_RUN (via budget_state["bytes"])
-      - MAX_SINGLE_FILE_BYTES
-      - STOP_SENTINEL
-    Retorna quantos arquivos foram baixados.
-    """
+def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, int]) -> int:
     logger = logging.getLogger("run")
     os.makedirs(out_dir, exist_ok=True)
     items = fetch_strain_files_for_event(event)
@@ -252,16 +213,15 @@ def ensure_event_downloaded(event: str,
         return 0
 
     downloaded = 0
-
     for item in items:
         if os.path.exists(STOP_SENTINEL):
             logger.warning("STOP detectado — interrompendo downloads com segurança.")
             break
         if downloaded >= MAX_FILES_PER_EVENT:
-            logger.info(f"{event}: atingiu limite de {MAX_FILES_PER_EVENT} arquivo(s).")
+            logger.info(f"{event}: limite {MAX_FILES_PER_EVENT} atingido.")
             break
         if budget_state["bytes"] >= MAX_DOWNLOAD_BYTES_PER_RUN:
-            logger.info("Cota de download desta execução atingida. Parando.")
+            logger.info("Cota de download desta execução atingida.")
             break
 
         choice = _choose_url_and_name(item)
@@ -269,7 +229,6 @@ def ensure_event_downloaded(event: str,
             continue
         url, fname = choice
         fpath = os.path.join(out_dir, fname)
-
         if os.path.exists(fpath):
             logger.info(f"{event}: já existe → {fname} (pulando)")
             continue
@@ -286,16 +245,15 @@ def ensure_event_downloaded(event: str,
             logger.info(f"{event}: {fname} ({size/1e9:.2f} GB) > limite de arquivo. Pulando.")
             continue
 
-        # verifica cota + espaço
-        need = size if size else 256 * 1024**2  # assume ~256MB se desconhecido
+        need = size if size else 256 * 1024**2
         if (budget_state["bytes"] + need) > MAX_DOWNLOAD_BYTES_PER_RUN:
-            logger.info("Cota de download ficaria acima do limite. Parando.")
+            logger.info("Ultrapassaria cota desta execução. Parando.")
             break
         if not _enough_space(out_dir, need):
-            logger.error("Espaço em disco insuficiente para continuar.")
+            logger.error("Espaço em disco insuficiente.")
             break
 
-        # Download com barra de progresso
+        # Download com progresso
         logger.info(f"{event}: baixando {fname} ...")
         with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
@@ -315,31 +273,19 @@ def ensure_event_downloaded(event: str,
 
     return downloaded
 
-
 # =============================================================================
-# PRÉ-PROCESSAMENTO: somente novos
+# WHITENING — apenas arquivos novos
 # =============================================================================
-def whiten_missing(in_dir: str, out_dir: str) -> int:
-    """
-    Percorre *.hdf5 em in_dir e processa só os que ainda não têm *_whitened.hdf5 em out_dir.
-    Retorna quantos processou nesta execução.
-    """
-    logger = logging.getLogger("run")
+def whiten_missing(in_dir: str, out_dir: str) -> List[str]:
     os.makedirs(out_dir, exist_ok=True)
-
     raw_files = _list_files(os.path.join(in_dir, "*.hdf5"))
-    if not raw_files:
-        logger.warning(f"Nenhum .hdf5 encontrado em {in_dir}.")
-        return 0
-
-    processed_now = 0
+    saved = []
     for fpath in tqdm(raw_files, desc="Pré-processando (novos)", unit="arq"):
         base = os.path.basename(fpath)
         out_name = base.replace(".hdf5", "_whitened.hdf5")
         out_path = os.path.join(out_dir, out_name)
         if os.path.exists(out_path):
             continue
-
         out = pp.process_file(
             in_path=fpath,
             out_dir=out_dir,
@@ -353,66 +299,97 @@ def whiten_missing(in_dir: str, out_dir: str) -> int:
             order_bp=ORDER_BP,
         )
         if out:
-            processed_now += 1
+            saved.append(out)
+    return saved
 
-    return processed_now
-
+# =============================================================================
+# WINDOWS/SNR — apenas whitened novos
+# =============================================================================
+def window_missing(interim_dir: str, processed_dir: str) -> List[str]:
+    os.makedirs(processed_dir, exist_ok=True)
+    done = []
+    for wp in _list_files(os.path.join(interim_dir, "*_whitened.hdf5")):
+        base = os.path.basename(wp).replace("_whitened.hdf5", "")
+        out_name = f"{base}_windows.hdf5"
+        out_path = os.path.join(processed_dir, out_name)
+        if os.path.exists(out_path):
+            continue
+        out = process_whitened_file(
+            in_path=wp,
+            out_dir=processed_dir,
+            window_sec=WINDOW_SEC,
+            stride_sec=STRIDE_SEC,
+            snr_threshold=SNR_THRESHOLD,
+            save_windows=SAVE_WINDOWS,
+        )
+        if out:
+            done.append(out)
+    return done
 
 # =============================================================================
 # EXECUÇÃO
 # =============================================================================
 def main():
     logger = setup_logging()
-
     # Dirs
-    os.makedirs(DATA_RAW, exist_ok=True)
-    os.makedirs(DATA_INTERIM, exist_ok=True)
+    for d in (DATA_RAW, DATA_INTERIM, DATA_PROCESSED):
+        os.makedirs(d, exist_ok=True)
 
     logger.info("==== PIPELINE (sem argumentos) ====")
+    logger.info(f"Toggles: download={ENABLE_DOWNLOAD} | whiten={ENABLE_WHITEN} | windows={ENABLE_WINDOWS}")
     logger.info(f"PROFILE = {PROFILE}")
-    logger.info(f"RAW={DATA_RAW} | INTERIM={DATA_INTERIM}")
+    logger.info(f"RAW={DATA_RAW} | INTERIM={DATA_INTERIM} | PROCESSED={DATA_PROCESSED}")
     logger.info(f"Preferências: HDF5={PREFER_HDF5} | 4kHz={PREFER_4KHZ} | 4096s={PREFER_DURATION_4096S} | Detectores={sorted(ALLOW_DETECTORS)}")
     logger.info(f"Limites: MAX_BYTES_RUN={MAX_DOWNLOAD_BYTES_PER_RUN/1e9:.2f} GB | MAX_EVENTS_RUN={MAX_EVENTS_PER_RUN} | MAX_FILES_EVENT={MAX_FILES_PER_EVENT}")
-    logger.info(f"Pré-proc: bandpass=({LOWCUT},{HIGHCUT}) ord={ORDER_BP} | notch={NOTCH_BASE} Hz x {NOTCH_HARMS} | PSD={PSD_SEG}s/{PSD_OVERLAP}")
+    logger.info(f"Pré-proc: bandpass=({LOWCUT},{HIGHCUT}) ord={ORDER_BP} | notch={NOTCH_BASE}Hz x {NOTCH_HARMS} | PSD={PSD_SEG}s/{PSD_OVERLAP}")
+    logger.info(f"Windows: win={WINDOW_SEC}s stride={STRIDE_SEC}s | thr={SNR_THRESHOLD} | save={SAVE_WINDOWS}")
     logger.info("====================================")
 
-    # 1) Descobrir eventos
-    all_events = fetch_all_events()
-    if MAX_EVENTS_PER_RUN and len(all_events) > MAX_EVENTS_PER_RUN:
-        events = all_events[:MAX_EVENTS_PER_RUN]
-    else:
-        events = all_events
-    logger.info(f"Processando nesta execução até {len(events)} evento(s).")
-
-    # 2) Downloads controlados
-    budget = {"bytes": 0}
     total_downloaded = 0
-    for ev in tqdm(events, desc="Eventos (download se faltar)", unit="evt"):
-        try:
-            total_downloaded += ensure_event_downloaded(ev, DATA_RAW, budget)
-            if budget["bytes"] >= MAX_DOWNLOAD_BYTES_PER_RUN:
-                break
-            if os.path.exists(STOP_SENTINEL):
-                logger.warning("STOP detectado — encerrando ciclo de downloads.")
-                break
-        except Exception as e:
-            logger.error(f"Falha no evento {ev}: {e}")
+    whitened_now: List[str] = []
+    windows_now: List[str] = []
 
-    # 3) Pré-processar somente o que falta
-    processed_now = whiten_missing(DATA_RAW, DATA_INTERIM)
+    # 1) Download controlado
+    if ENABLE_DOWNLOAD:
+        all_events = fetch_all_events()
+        events = all_events[:MAX_EVENTS_PER_RUN] if MAX_EVENTS_PER_RUN else all_events
+        logger.info(f"Processando nesta execução até {len(events)} evento(s) para DOWNLOAD.")
+        budget = {"bytes": 0}
+        for ev in tqdm(events, desc="Eventos (download se faltar)", unit="evt"):
+            try:
+                total_downloaded += ensure_event_downloaded(ev, DATA_RAW, budget)
+                if budget["bytes"] >= MAX_DOWNLOAD_BYTES_PER_RUN or os.path.exists(STOP_SENTINEL):
+                    break
+            except Exception as e:
+                logger.error(f"Falha no evento {ev}: {e}")
+    else:
+        logger.info("Download desativado (ENABLE_DOWNLOAD=False).")
+
+    # 2) Whitening (novos)
+    if ENABLE_WHITEN:
+        whitened_now = whiten_missing(DATA_RAW, DATA_INTERIM)
+    else:
+        logger.info("Whitening desativado (ENABLE_WHITEN=False).")
+
+    # 3) Janelas/SNR (novos)
+    if ENABLE_WINDOWS:
+        windows_now = window_missing(DATA_INTERIM, DATA_PROCESSED)
+    else:
+        logger.info("Janelas/SNR desativado (ENABLE_WINDOWS=False).")
 
     # 4) Resumo
-    raw_count     = len(_list_files(os.path.join(DATA_RAW, "*.hdf5")))
-    interim_count = len(_list_files(os.path.join(DATA_INTERIM, "*_whitened.hdf5")))
+    raw_count       = len(_list_files(os.path.join(DATA_RAW, "*.hdf5")))
+    interim_count   = len(_list_files(os.path.join(DATA_INTERIM, "*_whitened.hdf5")))
+    processed_count = len(_list_files(os.path.join(DATA_PROCESSED, "*_windows.hdf5")))
     logger.info("======== RESUMO ========")
-    logger.info(f"Baixados nesta execução : {total_downloaded} arquivo(s)  (~{budget['bytes']/1e9:.2f} GB)")
-    logger.info(f"Pré-processados (novos) : {processed_now} arquivo(s)")
+    logger.info(f"Baixados nesta execução : {total_downloaded} arquivo(s)")
+    logger.info(f"Whitened (novos)        : {len(whitened_now)} arquivo(s)")
+    logger.info(f"Windows/SNR (novos)     : {len(windows_now)} arquivo(s)")
     logger.info(f"Total em RAW            : {raw_count}")
     logger.info(f"Total em INTERIM        : {interim_count}")
+    logger.info(f"Total em PROCESSED      : {processed_count}")
     logger.info("=========================")
 
-
 if __name__ == "__main__":
-    # permite: python src/run.py
     sys.path.append(os.path.dirname(__file__))
     main()
