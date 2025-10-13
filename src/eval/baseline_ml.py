@@ -1,16 +1,22 @@
 # src/eval/baseline_ml.py
 # -------------------------------------------------------------------------------------------------
-# Baseline ML com GPU (XGBoost 2.x):
-# - Usa device="cuda" (ou "cpu" se CUDA indisponível)
-# - Split por grupos (file_id) 70/15/15 sem vazamento
+# Baseline ML (CPU por padrão) com opção de GPU via XGBoost 2.x:
+# - Cria 'split' por grupos (file_id/evento) se não existir (70/15/15) sem vazamento
 # - Downsampling de negativos no treino
-# - Calibração opcional
-# - Estratégias de limiar: "best_f1" ou "target_far" (com fallback robusto)
-# - Salva métricas, plots, scores e model.joblib
+# - Calibração opcional (sigmoid)
+# - Thresholds: "best_f1" ou "target_far" (robusto, sem KeyError)
+# - Salva métricas, plots, scores_test e model.joblib (com asdict(CFG))
+# - Se criar split, escreve data/processed/dataset_with_split.parquet
+#
+# Requisitos:
+#   pip install pandas numpy scikit-learn matplotlib pyarrow joblib tqdm
+#   (GPU)      pip install xgboost>=2.0
+#
+# Para usar GPU: defina CFG.MODEL="xgb" (já é o default) e mantenha XGB_DEVICE="cuda".
 # -------------------------------------------------------------------------------------------------
 
 from __future__ import annotations
-import os, json, time, warnings
+import os, json, time
 from dataclasses import dataclass, asdict
 from typing import Tuple, Dict, Optional, List
 
@@ -20,11 +26,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-try:
-    import seaborn as sns
-    sns.set_context("talk"); sns.set_style("whitegrid")
-except Exception:
-    pass
 
 from tqdm import tqdm
 
@@ -42,7 +43,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupShuffleSplit
 import joblib
 
-# XGBoost (GPU 2.x)
+# XGBoost (GPU opcional)
 try:
     import xgboost as xgb
     _HAS_XGB = True
@@ -59,14 +60,14 @@ class Cfg:
     DATASET_WITH_SPLIT: str = os.path.join("data", "processed", "dataset_with_split.parquet")
     OUT_DIR: str = os.path.join("reports", "baseline_ml")
 
-    # MODEL: "xgb" (GPU), "rf" ou "logreg"
+    # MODEL: "logreg" | "rf" | "xgb" (GPU via XGBoost 2.x)
     MODEL: str = "xgb"
     SEED: int = 42
     VERBOSE: bool = True
 
     # ---- LogReg
     LOGREG_C: float = 2.0
-    LOGREG_PENALTY: str = "l2"
+    LOGREG_PENALTY: str = "l2"        # "l1" | "l2"
     LOGREG_MAX_ITER: int = 800
 
     # ---- RandomForest
@@ -76,7 +77,7 @@ class Cfg:
     RF_N_JOBS: int = -1
     RF_CLASS_WEIGHT: Optional[str] = "balanced_subsample"
 
-    # ---- XGBoost 2.x (GPU)
+    # ---- XGBoost (GPU em 2.x usa device="cuda" + tree_method="hist")
     XGB_N_EST: int = 800
     XGB_MAX_DEPTH: int = 8
     XGB_LR: float = 0.05
@@ -86,27 +87,26 @@ class Cfg:
     XGB_REG_L2: float = 1.0
     XGB_MAX_BIN: int = 256
     XGB_EVAL_METRIC: str = "auc"
-    XGB_TREE_METHOD: str = "hist"     # com device="cuda", usa GPU
-    XGB_DEVICE: str = "cuda"          # "cuda" ou "cpu"
-    XGB_PREDICTOR: str = "auto"
-    XGB_N_JOBS: int = 0               # 0 -> deixa a GPU trabalhar
+    XGB_TREE_METHOD: str = "hist"      # com device="cuda" -> GPU
+    XGB_DEVICE: str = "cuda"           # "cuda" | "cpu"
+    XGB_N_JOBS: int = 0                # 0 = deixe a GPU trabalhar
 
     # ---- Features
     NUM_COLS: tuple = ("snr_rms", "snr_peak", "crest_factor", "window_sec", "stride_sec")
     CAT_COLS: tuple = ("detector",)
 
-    # aplicar log1p nestas numéricas
+    # aplicar log1p apenas nestas numéricas (por nome)
     APPLY_LOG1P_ON: tuple = ("snr_rms", "snr_peak", "crest_factor")
 
-    # ---- Threshold
-    THRESH_STRATEGY: str = "best_f1"  # "best_f1" | "target_far"
-    TARGET_FAR: float = 0.01          # FPR alvo quando usar "target_far"
-    FAR_GRID: tuple = (1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2)
+    # ---- Estratégias de threshold
+    THRESH_STRATEGY: str = "best_f1"   # "best_f1" | "target_far"
+    TARGET_FAR: float = 0.01           # FAR alvo (FPR) quando THRESH_STRATEGY="target_far"
+    FAR_REPORT_GRID: tuple = (1e-6, 5e-6, 1e-5, 5e-4, 1e-3, 5e-3, 1e-2)
 
     # ---- Calibração
-    CALIBRATE_PROBA: bool = True
+    CALIBRATE_PROBA: bool = True       # bom p/ RF e p/ XGB em classe rara
 
-    # ---- Downsampling (treino)
+    # ---- Downsampling de negativos no TREINO
     ENABLE_NEG_DOWNSAMPLE: bool = True
     MAX_NEG_PER_POS: int = 50
 
@@ -118,7 +118,7 @@ CFG = Cfg()
 # =========================
 def _log(msg: str):
     if CFG.VERBOSE:
-        print(msg)
+        print(msg, flush=True)
 
 def ts_now() -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.localtime())
@@ -139,25 +139,31 @@ def _check_required_cols(df: pd.DataFrame):
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Dataset missing required columns: {missing}. "
-                         f"Columns present (sample): {list(df.columns)[:20]}")
+                         f"Columns present: {list(df.columns)[:20]}...")
 
 def _ensure_group_col(df: pd.DataFrame) -> pd.Series:
     if "file_id" in df.columns:
-        return df["file_id"].astype(str)
-    if "event_hint" in df.columns:
-        return df["event_hint"].astype(str)
-    base = (df.get("start_gps", pd.Series(index=df.index, data=-1)).astype(str) +
-            "_" + df.get("detector", pd.Series(index=df.index, data="UNK")).astype(str))
-    return base
+        g = df["file_id"].astype(str)
+    elif "event_hint" in df.columns:
+        g = df["event_hint"].astype(str)
+    else:
+        base = (df.get("start_gps", pd.Series(index=df.index, data=-1)).astype(str) +
+                "_" + df.get("detector", pd.Series(index=df.index, data="UNK")).astype(str))
+        g = base
+    return g
 
 def _assign_split_groups(df: pd.DataFrame, seed: int = 42) -> pd.Series:
-    groups = _ensure_group_col(df); idx = np.arange(len(df))
+    groups = _ensure_group_col(df)
+    idx = np.arange(len(df))
+    # 70% train / 30% temp
     gss = GroupShuffleSplit(n_splits=1, train_size=0.70, random_state=seed)
     tr_idx, temp_idx = next(gss.split(idx, groups=groups))
+    # 15/15 val/test
     temp_groups = groups.iloc[temp_idx]
     gss2 = GroupShuffleSplit(n_splits=1, train_size=0.50, random_state=seed+1)
     va_rel, te_rel = next(gss2.split(temp_idx, groups=temp_groups))
-    va_idx, te_idx = temp_idx[va_rel], temp_idx[te_rel]
+    va_idx = temp_idx[va_rel]
+    te_idx = temp_idx[te_rel]
 
     split = pd.Series(index=df.index, data="", dtype="object")
     split.iloc[tr_idx] = "train"
@@ -214,7 +220,7 @@ def downsample_train(train_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# Transformações numéricas (top-level, picklável)
+# Transformações numéricas (TOP-LEVEL, picklável)
 # =========================
 def _log1p_indices(X: np.ndarray, indices: tuple) -> np.ndarray:
     X = np.asarray(X, dtype=float)
@@ -267,7 +273,7 @@ def build_estimator(model_name: str):
     if model_name == "xgb":
         if not _HAS_XGB:
             raise RuntimeError("XGBoost não instalado. Instale com: pip install xgboost>=2.0")
-        # XGBoost 2.x: GPU => device="cuda" + tree_method="hist"
+        # Em XGBoost 2.x: device="cuda" ativa GPU; tree_method="hist"
         base = xgb.XGBClassifier(
             n_estimators=CFG.XGB_N_EST,
             max_depth=CFG.XGB_MAX_DEPTH,
@@ -279,13 +285,11 @@ def build_estimator(model_name: str):
             max_bin=CFG.XGB_MAX_BIN,
             objective="binary:logistic",
             eval_metric=CFG.XGB_EVAL_METRIC,
-            tree_method=CFG.XGB_TREE_METHOD,   # "hist"
-            device=CFG.XGB_DEVICE,             # "cuda" usa GPU
-            predictor=CFG.XGB_PREDICTOR,
+            tree_method=CFG.XGB_TREE_METHOD,
+            device=CFG.XGB_DEVICE,     # "cuda" => GPU
             random_state=CFG.SEED,
             n_jobs=CFG.XGB_N_JOBS
         )
-        # Calibração costuma ajudar com classe rara
         return CalibratedClassifierCV(base, cv=3, method="sigmoid") if CFG.CALIBRATE_PROBA else base
 
     raise ValueError(f"MODEL inválido: {model_name}")
@@ -353,7 +357,9 @@ def find_threshold_best_f1(y_true: np.ndarray, y_score: np.ndarray):
     return float(best_thr), best_stats
 
 def find_threshold_by_far(y_true: np.ndarray, y_score: np.ndarray, far: float):
-    """retorna (threshold, info_dict) para o FAR alvo; percorre ordem decrescente de score."""
+    """
+    Encontra o menor limiar cujo FPR <= far. Robusto, sem depender de grids externos.
+    """
     order = np.argsort(-y_score, kind="mergesort")
     yt = y_true[order]
     ys = y_score[order]
@@ -362,27 +368,36 @@ def find_threshold_by_far(y_true: np.ndarray, y_score: np.ndarray, far: float):
 
     fp = 0; tp = 0
     best = {"threshold": 1.0, "fpr": 0.0, "tpr": 0.0, "precision": 1.0, "recall": 0.0}
-    for i in tqdm(range(len(ys)), desc=f"[VAL] FAR≤{far:.3%}", unit="cut", leave=False):
+    for i in range(len(ys)):
         thr = ys[i]
         if yt[i] == 1: tp += 1
         else: fp += 1
         fpr = fp / max(n0, 1); tpr = tp / max(n1, 1)
         prec = tp / max(tp + fp, 1); rec = tpr
-        best = {"threshold": float(thr), "fpr": float(fpr), "tpr": float(tpr),
-                "precision": float(prec), "recall": float(rec)}
         if fpr <= far:
+            best = {"threshold": float(thr), "fpr": float(fpr), "tpr": float(tpr),
+                    "precision": float(prec), "recall": float(rec)}
             break
+
+    # Proteção: se threshold ficou <= max(negativos), empurra 1 ULP acima
+    neg = y_score[y_true == 0]
+    if neg.size:
+        neg_max = float(np.max(neg))
+        if best["threshold"] <= neg_max:
+            best["threshold"] = float(np.nextafter(neg_max, np.float32(np.inf)))
+            best["fpr"] = float((y_score[y_true==0] >= best["threshold"]).mean())
+
     return float(best["threshold"]), best
 
 
 # =========================
-# Plots
+# Plots + Features
 # =========================
 def plot_roc_pr(y_true, y_score, out_dir: str, tag: str):
     ensure_dir(out_dir)
     try:
         fpr, tpr, _ = roc_curve(y_true, y_score)
-        auc_roc = roc_auc_score(y_true, y_score)
+        auc_roc = roc_auc_score(y_true, y_score) if len(np.unique(y_true))>1 else float("nan")
         plt.figure(figsize=(6,5))
         plt.plot(fpr, tpr, label=f"AUC = {auc_roc:.4f}")
         plt.plot([0,1], [0,1], 'k--', alpha=0.5)
@@ -392,7 +407,7 @@ def plot_roc_pr(y_true, y_score, out_dir: str, tag: str):
         pass
     try:
         prec, rec, _ = precision_recall_curve(y_true, y_score)
-        ap = average_precision_score(y_true, y_score)
+        ap = average_precision_score(y_true, y_score) if len(np.unique(y_true))>1 else float("nan")
         plt.figure(figsize=(6,5))
         plt.plot(rec, prec, label=f"AP = {ap:.4f}")
         plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(f"PR — {tag}"); plt.legend()
@@ -412,26 +427,36 @@ def plot_conf_mat(tn, fp, fn, tp, out_dir: str, tag: str):
     plt.title(f"Confusion — {tag}"); plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"cm_{tag}.png"), dpi=160); plt.close()
 
+def feature_names_after_pre(pipe: Pipeline, X_sample: pd.DataFrame) -> List[str]:
+    pre: ColumnTransformer = pipe.named_steps["pre"]
+    out_names: List[str] = []
+    for name, trans, cols in pre.transformers_:
+        if name == "num":
+            out_names += list(cols)
+        elif name == "cat":
+            oh: OneHotEncoder = trans.named_steps["onehot"]
+            out_names += list(oh.get_feature_names_out(cols))
+    return out_names
+
 
 # =========================
 # Main
 # =========================
 def main():
-    warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
     t_all = time.time()
     assert os.path.exists(CFG.DATASET), f"Dataset não encontrado: {CFG.DATASET}"
     _log("[1/6] Lendo dataset…")
     df = pd.read_parquet(CFG.DATASET)
 
-    # Garante 'split'
+    # --- Garante 'split' se faltar ---
     df = ensure_splits(df, save_sidecar=True)
+
     tr, va, te = split_sets(df)
     _log(f"   • train={len(tr):,}  val={len(va):,}  test={len(te):,}")
 
     _log("[2/6] Downsampling do treino…")
     tr_ds = downsample_train(tr)
-    _log(f"   • treino (após downsample): {len(tr_ds):,}  "
-         f"(pos={int((tr_ds['label']==1).sum()):,}, neg={int((tr_ds['label']==0).sum()):,})")
+    _log(f"   • treino (após downsample): {len(tr_ds):,}  (pos={int((tr_ds['label']==1).sum()):,}, neg={int((tr_ds['label']==0).sum()):,})")
 
     _log("[3/6] Preparando X/y…")
     Xtr, ytr = to_xy(tr_ds)
@@ -445,37 +470,22 @@ def main():
     train_time = time.time() - t0
     _log(f"   • tempo de treino: {train_time:.2f}s")
 
-    _log("[5/6] Avaliando (val) e escolhendo limiar…")
+    _log("[5/6] Avaliando e escolhendo limiar (val)…")
     p_va = safe_proba(pipe, Xva)
-    print(f"   • val: y=1 -> {(yva==1).sum()} | y=0 -> {(yva==0).sum()} "
-          f"| scores[min/med/max]=({p_va.min():.4g}/{np.median(p_va):.4g}/{p_va.max():.4g})")
+    print(f"   • val: y=1 -> {(yva==1).sum()} | y=0 -> {(yva==0).sum()} | scores[min/med/max]=({p_va.min():.4g}/{np.median(p_va):.4g}/{p_va.max():.4g})")
 
     thr_best_f1, stats_best = find_threshold_best_f1(yva, p_va)
 
-    far_thresholds: Dict[str, Dict] = {}
-    for far in CFG.FAR_GRID:
-        thr_far, info = find_threshold_by_far(yva, p_va, far=far)
-        far_thresholds[str(far)] = info
+    # Threshold por FAR (direto, sem dicionário → evita KeyError)
+    thr_far, info_far = find_threshold_by_far(yva, p_va, far=float(CFG.TARGET_FAR))
 
-    # Escolha robusta do threshold:
-    if CFG.THRESH_STRATEGY == "best_f1":
-        thr_main = thr_best_f1
-    else:
-        # tenta usar exatamente TARGET_FAR; se não existe no grid, calcula on-the-fly;
-        # se ainda assim falhar, pega o FAR do grid mais próximo ao TARGET_FAR.
-        key = str(CFG.TARGET_FAR)
-        if key in far_thresholds:
-            thr_main = float(far_thresholds[key]["threshold"])
-        else:
-            try:
-                thr_tmp, info_tmp = find_threshold_by_far(yva, p_va, far=float(CFG.TARGET_FAR))
-                thr_main = float(thr_tmp)
-                far_thresholds[key] = info_tmp
-            except Exception:
-                # pega o FAR mais próximo do grid
-                arr = np.array(CFG.FAR_GRID, dtype=float)
-                near = float(arr[np.argmin(np.abs(arr - float(CFG.TARGET_FAR)))])
-                thr_main = float(far_thresholds[str(near)]["threshold"])
+    # Também reporta uma grelha útil (para análise posterior)
+    far_report = {}
+    for far in CFG.FAR_REPORT_GRID:
+        ttmp, iinfo = find_threshold_by_far(yva, p_va, far=float(far))
+        far_report[str(far)] = iinfo
+
+    thr_main = thr_best_f1 if CFG.THRESH_STRATEGY == "best_f1" else thr_far
 
     _log("[6/6] Avaliando no TEST…")
     p_te = safe_proba(pipe, Xte)
@@ -494,9 +504,10 @@ def main():
         "val": {
             "roc_auc": float(roc_auc_score(yva, p_va)) if len(np.unique(yva))>1 else None,
             "pr_ap":  float(average_precision_score(yva, p_va)) if len(np.unique(yva))>1 else None,
-            "best_f1": stats_best
+            "best_f1": stats_best,
+            "target_far": {"target": float(CFG.TARGET_FAR), **info_far},
         },
-        "val_far_thresholds": far_thresholds,
+        "val_far_report": far_report,
         "test": {
             "roc_auc": float(roc_auc_score(yte, p_te)) if len(np.unique(yte))>1 else None,
             "pr_ap":  float(average_precision_score(yte, p_te)) if len(np.unique(yte))>1 else None,
@@ -509,13 +520,15 @@ def main():
 
     out_dir = os.path.join(CFG.OUT_DIR, ts_now()); ensure_dir(out_dir)
 
+    # JSONs
     with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
     with open(os.path.join(out_dir, "thresholds.json"), "w", encoding="utf-8") as f:
         json.dump({
             "best_f1": {"threshold": float(thr_best_f1), **stats_best},
-            "far_grid_val": far_thresholds,
+            "target_far": {"target": float(CFG.TARGET_FAR), **info_far},
+            "far_report_grid": far_report,
             "strategy_used": CFG.THRESH_STRATEGY,
             "threshold_used": float(thr_main)
         }, f, indent=2)
@@ -532,16 +545,19 @@ def main():
     except Exception:
         pass
 
+    # dump de scores do TEST
     try:
-        dump_cols = ["file_id", "event_hint", "detector", "start_gps",
-                     "window_sec", "stride_sec", "snr_rms", "snr_peak", "crest_factor", "label"]
-        subset = te[dump_cols].copy()
+        cols_keep = [c for c in ["file_id", "event_hint", "detector", "start_gps",
+                                 "window_sec", "stride_sec", "snr_rms", "snr_peak", "crest_factor", "label"]
+                     if c in te.columns]
+        subset = te[cols_keep].copy()
         subset["score"] = p_te
         subset["pred"] = yhat_te
         subset.to_parquet(os.path.join(out_dir, "scores_test.parquet"), index=False)
     except Exception:
         pass
 
+    # salva modelo (picklável)
     joblib.dump({"pipeline": pipe, "threshold": float(thr_main), "cfg": asdict(CFG)},
                 os.path.join(out_dir, "model.joblib"),
                 compress=3)
