@@ -143,6 +143,53 @@ def _timer():
     t0 = time.time()
     return lambda: time.time() - t0
 
+# === ADD: helpers para resumir o MF ===
+def _latest_subdir(root: str) -> Optional[str]:
+    if not os.path.isdir(root):
+        return None
+    subs = [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    return max(subs, key=os.path.getmtime) if subs else None
+
+def _summarize_latest_mf(logger):
+    mf_root = os.path.join(REPORTS_DIR, "mf_baseline")
+    latest = _latest_subdir(mf_root)
+    if not latest:
+        logger.info("[MF] Nenhum relatório encontrado em reports/mf_baseline/")
+        return
+    summ = os.path.join(latest, "summary.json")
+    if not os.path.exists(summ):
+        logger.info(f"[MF] Sem summary.json em {latest}")
+        return
+    try:
+        with open(summ, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        cfg = s.get("cfg", {})
+        val = s.get("val", {})
+        test = s.get("test", {})
+        thr  = s.get("threshold")
+        tinfo = s.get("threshold_info", {})
+        conf = test.get("confusion_at_thr", {}) or {}
+        tn, fp, fn, tp = (conf.get("tn",0), conf.get("fp",0), conf.get("fn",0), conf.get("tp",0))
+
+        # métricas derivadas no limiar utilizado
+        prec = tp / max(tp+fp, 1)
+        rec  = tp / max(tp+fn, 1)
+        fpr  = fp / max(tn+fp, 1)
+
+        logger.info("--------------- MF SUMMARY ---------------")
+        logger.info(f"Saída: {latest}")
+        logger.info(f"GPU: requested={s.get('gpu',{}).get('requested')} available={s.get('gpu',{}).get('available')}")
+        logger.info(f"Templates={cfg.get('TEMPLATES_N')} | fs={cfg.get('FS_TARGET')} Hz | lag_step={cfg.get('LAG_STEP')} | ±shift={cfg.get('MAX_SHIFT_SEC')}s")
+        logger.info(f"MODE={cfg.get('MODE')} | target_far={cfg.get('TARGET_FAR')}")
+        logger.info(f"VAL: AUC={val.get('auc')} | AP={val.get('ap')}")
+        logger.info(f"TEST: AUC={test.get('auc')} | AP={test.get('ap')}")
+        logger.info(f"Limiar usado: {thr} | info={tinfo}")
+        logger.info(f"Conf@thr: tn={tn} fp={fp} fn={fn} tp={tp}")
+        logger.info(f"Prec@thr={prec:.6f} | Recall@thr={rec:.6f} | FPR@thr={fpr:.6f}")
+        logger.info("-----------------------------------------")
+    except Exception as e:
+        logger.error(f"[MF] Falha ao ler summary.json: {e}")
+
 # ============================================================
 # API v2: eventos (paginado)
 # ============================================================
@@ -423,6 +470,8 @@ def main():
     tag_mf = stage_mf_baseline(logger)
     if tag_mf:
         logger.info(f"[MF] Concluído em {t():.1f}s")
+        _summarize_latest_mf(logger)
+
 
     # RESUMO
     raw_count       = len(_list_files(os.path.join(DATA_RAW, "*.hdf5")))

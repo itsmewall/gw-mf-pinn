@@ -1,29 +1,38 @@
+# scripts/cuda_env.sh
 #!/usr/bin/env bash
-# Configura LD_LIBRARY_PATH com as libs CUDA empacotadas no site-packages do venv.
-# Uso:  source venv/bin/activate && source scripts/cuda_env.sh
+set -Eeuo pipefail
 
-set -euo pipefail
+# Este script pressupõe que o venv já está ativo (VIRTUAL_ENV definido).
+: "${VIRTUAL_ENV:?Ative o venv antes de chamar cuda_env.sh}"
 
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-  echo "[cuda_env] Ative o venv primeiro:  source venv/bin/activate" >&2
-  return 1 2>/dev/null || exit 1
-fi
-
-SITEPKG="$(python - <<'PY'
-import site
-cands=[p for p in site.getsitepackages() if 'site-packages' in p]
-print(cands[0] if cands else site.getusersitepackages())
+# Descobre o site-packages do venv atual
+SITEPKG="$(
+  python - <<'PY'
+import site, sys
+paths=[p for p in site.getsitepackages() if 'site-packages' in p]
+print(paths[0] if paths else site.getusersitepackages())
 PY
 )"
 
-# Caminhos das libs empacotadas pelos wheels NVIDIA
+# Pastas das libs CUDA empacotadas via pip (nvidia-*)
 CUFFT_DIR="$SITEPKG/nvidia/cufft/lib"
 CURAND_DIR="$SITEPKG/nvidia/curand/lib"
-CUDART_DIR="$SITEPKG/nvidia/cuda_runtime/lib"
+CRT_DIR="$SITEPKG/nvidia/cuda_runtime/lib"
 
-# Verificações rápidas
-[[ -e "$CUFFT_DIR/libcufft.so.11" ]] || { echo "[cuda_env] libcufft.so.11 não encontrado em $CUFFT_DIR"; return 1 2>/dev/null || exit 1; }
-[[ -e "$CURAND_DIR/libcurand.so.10" ]] || { echo "[cuda_env] libcurand.so.10 não encontrado em $CURAND_DIR"; return 1 2>/dev/null || exit 1; }
+# Garante que LD_LIBRARY_PATH exista
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 
-export LD_LIBRARY_PATH="$CUFFT_DIR:$CURAND_DIR:$CUDART_DIR:${LD_LIBRARY_PATH:-}"
+# Só adiciona se existir
+add_path() {
+  local p="$1"
+  if [[ -d "$p" ]] && [[ ":$LD_LIBRARY_PATH:" != *":$p:"* ]]; then
+    LD_LIBRARY_PATH="$p${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+}
+
+add_path "$CUFFT_DIR"
+add_path "$CURAND_DIR"
+add_path "$CRT_DIR"
+
+export LD_LIBRARY_PATH
 echo "[cuda_env] LD_LIBRARY_PATH configurado."

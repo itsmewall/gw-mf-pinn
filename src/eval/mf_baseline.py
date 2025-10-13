@@ -8,6 +8,13 @@
 # - Restrições de lag (±MAX_SHIFT_SEC) + passo LAG_STEP
 # - Subamostragem de templates + cache .npz
 # - Compatível com dataset que use 'split' OU 'subset'
+#
+# Melhorias desta versão:
+#   * Self-test robusto: compara NCC por DOT (sem lag) vs FFT (com lags) e alerta desalinhamento
+#   * Limiar por FAR (target_far) nunca retorna 0.0; empurra para acima do max(negativos)
+#   * Logs de distribuição de scores (min/med/max, fração > 1e-6)
+#   * Upload único de templates para a GPU; limpeza do memory pool entre batches
+#   * nfft = próxima potência de 2; normalização estável; proteção contra NaN/Inf
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -76,7 +83,7 @@ class CFG:
     GPU_TEMPLATES_PER_CHUNK: int = 999_999  # manter todos por padrão
 
     # banco de templates
-    TEMPLATES_N: int = 64                   # reduza/eleve conforme VRAM
+    TEMPLATES_N: int = 256                  # ajuste conforme VRAM
     TEMPLATE_SUBSAMPLE: int = 1             # usa 1 a cada K
     M1_RANGE: Tuple[float, float] = (5.0, 40.0)
     M2_RANGE: Tuple[float, float] = (5.0, 40.0)
@@ -87,8 +94,8 @@ class CFG:
     CACHE_FILE: str = "templates_cache.npz"
 
     # lags
-    MAX_SHIFT_SEC: float = 0.10             # ±0.10 s p/ acelerar
-    LAG_STEP: int = 32                       # stride nos lags
+    MAX_SHIFT_SEC: float = 0.25             # ±0.25 s
+    LAG_STEP: int = 8                        # stride nos lags
 
     # limites (aceleração controlada; mantenha None p/ full)
     MAX_VAL_ROWS: Optional[int] = None
@@ -102,12 +109,12 @@ class CFG:
     OUT_DIR_ROOT: str = "reports/mf_baseline"
 
     # paralelismo
-    N_JOBS: int = max(os.cpu_count() - 1, 1)  # CPU only; GPU usa 1
+    N_JOBS: int = 1
     BATCH_SZ: int = 256
 
     # feedback
-    HEARTBEAT_EVERY_N: int = 3000
-    HEARTBEAT_EVERY_SEC: float = 10.0
+    HEARTBEAT_EVERY_N: int = 10000
+    HEARTBEAT_EVERY_SEC: float = 100.0
     TQDM_MIN_INTERVAL: float = 0.5
 
 CFG = CFG()
@@ -116,7 +123,8 @@ CFG = CFG()
 # =========================
 # Helpers
 # =========================
-def _log(s: str): print(s)
+def _log(s: str): 
+    print(s, flush=True)
 
 def ts_tag() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -203,6 +211,7 @@ def synth_template(m1: float, m2: float, s1: float, s2: float,
     x = (x * w).astype(np.float32)
     x -= x.mean()
     x /= (x.std() + 1e-12)
+    x = np.nan_to_num(x, copy=False)
     return x
 
 def build_template_bank(n: int) -> List[Tuple[float, float, float, float]]:
@@ -281,21 +290,36 @@ def load_window_slice(win_path: str, whitened_path: str, start_gps: float) -> Op
 
     x -= x.mean()
     x /= (x.std() + 1e-12)
+    x = np.nan_to_num(x, copy=False)
     return x
 
 
 # =========================
 # NCC via FFT com restrição de lags
 # =========================
+def _next_pow2(n: int) -> int:
+    return 1 << (int(n - 1).bit_length())
+
 def _ncc_fft_max_cpu(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int) -> float:
+    # full conv via FFT (SciPy)
+    n_full = int(x.size + h.size - 1)
+    nfft = _next_pow2(n_full)
+    # conv com reversed template
     c = np_fftconvolve(x, h[::-1], mode="full")
     denom = (np.linalg.norm(x) * np.linalg.norm(h)) + 1e-12
     c = c / denom
+    # janela de lags
     L = c.size
     center = L // 2
     lo = max(0, center - max_shift_samp)
     hi = min(L, center + max_shift_samp + 1)
-    return float(np.nanmax(c[lo:hi:lag_step]))
+    seg = c[lo:hi:lag_step]
+    if seg.size == 0:
+        return 0.0
+    val = float(np.nanmax(seg))
+    if not np.isfinite(val):
+        return 0.0
+    return val
 
 def _ncc_fft_max_gpu(x_host: np.ndarray, h_dev, max_shift_samp: int, lag_step: int) -> float:
     # x_host: numpy no host; h_dev: cupy já no device (float32)
@@ -303,7 +327,7 @@ def _ncc_fft_max_gpu(x_host: np.ndarray, h_dev, max_shift_samp: int, lag_step: i
 
     # full convolution via FFT: conv(x, h_rev)
     n_full = int(x_dev.size + h_dev.size - 1)
-    nfft = 1 << (int((n_full - 1).bit_length()))  # próxima potência de 2
+    nfft = _next_pow2(n_full)
     X = cp.fft.rfft(x_dev, nfft)
     H = cp.fft.rfft(h_dev[::-1], nfft)
     c = cp.fft.irfft(X * cp.conj(H), nfft)[:n_full]
@@ -315,11 +339,16 @@ def _ncc_fft_max_gpu(x_host: np.ndarray, h_dev, max_shift_samp: int, lag_step: i
     center = L // 2
     lo = max(0, int(center - max_shift_samp))
     hi = min(L, int(center + max_shift_samp + 1))
-    m = cp.nanmax(c[lo:hi:lag_step])
-    val = float(m.get())
+    if lo >= hi:
+        val = 0.0
+    else:
+        m = cp.nanmax(c[lo:hi:lag_step])
+        val = float(m.get())
 
-    del X, H, c, x_dev, m
+    del X, H, c, x_dev
     cp.get_default_memory_pool().free_all_blocks()
+    if not np.isfinite(val):
+        return 0.0
     return val
 
 def ncc_fft_max(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int,
@@ -329,6 +358,17 @@ def ncc_fft_max(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int
             h_dev = cp.asarray(h, dtype=cp.float32)
         return _ncc_fft_max_gpu(x, h_dev, max_shift_samp, lag_step)
     return _ncc_fft_max_cpu(x, h, max_shift_samp, lag_step)
+
+def _ncc_dot_ref(x: np.ndarray, h: np.ndarray) -> float:
+    """NCC simples por produto interno como referência (sem lags)."""
+    x = np.asarray(x, np.float32); h = np.asarray(h, np.float32)
+    x = (x - x.mean()) / (x.std() + 1e-12)
+    h = (h - h.mean()) / (h.std() + 1e-12)
+    denom = (np.linalg.norm(x) * np.linalg.norm(h)) + 1e-12
+    val = float(np.dot(x, h) / denom)
+    if not np.isfinite(val):
+        return 0.0
+    return val
 
 
 # =========================
@@ -341,12 +381,17 @@ def pick_threshold(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]
     if CFG.MODE == "target_far":
         neg = scores[y_true == 0]
         if neg.size == 0:
-            return 0.0, {"mode": "target_far", "far": CFG.TARGET_FAR}
-        q = 1.0 - CFG.TARGET_FAR
+            # Sem negativos: não sinalizar nada por padrão
+            return 1.0, {"mode": "target_far", "far": CFG.TARGET_FAR}
+        q = max(0.0, min(1.0, 1.0 - CFG.TARGET_FAR))
         thr = float(np.quantile(neg, q)) if neg.size > 10 else float(np.max(neg))
+        neg_max = float(np.max(neg)) if neg.size else 0.0
+        if (not np.isfinite(thr)) or (thr <= neg_max):
+            thr = np.nextafter(neg_max, np.float32(np.inf))
         return thr, {"mode": "target_far", "far": CFG.TARGET_FAR}
 
-    thr_cand = np.unique(scores)
+    # best_f1
+    thr_cand = np.unique(scores[np.isfinite(scores)])
     best_f1, best_thr = -1.0, 0.0
     for t in thr_cand:
         yhat = (scores >= t).astype(int)
@@ -368,35 +413,42 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
     y_true = np.asarray(y_true).astype(int)
     scores = np.asarray(scores).astype(float)
 
-    auc = roc_auc_score(y_true, scores) if len(np.unique(y_true)) > 1 else float("nan")
-    ap  = average_precision_score(y_true, scores) if len(np.unique(y_true)) > 1 else float("nan")
+    uniq = np.unique(y_true)
+    if uniq.size <= 1:
+        auc = float("nan"); ap = float("nan")
+    else:
+        auc = roc_auc_score(y_true, scores)
+        ap  = average_precision_score(y_true, scores)
 
     try:
         fpr, tpr, _ = roc_curve(y_true, scores)
-        plt.figure(figsize=(4.5,4.5))
+        plt.figure(figsize=(4.8,4.6))
         plt.plot(fpr, tpr, label=f"AUC={auc:.3f}")
         plt.plot([0,1],[0,1],'k--',alpha=.4)
         plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title(f"ROC - {prefix}")
         plt.legend(); plt.grid(alpha=.2); plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"roc_{prefix}.png"), dpi=130); plt.close()
-    except Exception: pass
+    except Exception:
+        pass
 
     try:
         prec, rec, _ = precision_recall_curve(y_true, scores)
-        plt.figure(figsize=(4.5,4.5))
+        plt.figure(figsize=(4.8,4.6))
         plt.plot(rec, prec, label=f"AP={ap:.3f}")
         plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(f"PR - {prefix}")
         plt.legend(); plt.grid(alpha=.2); plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"pr_{prefix}.png"), dpi=130); plt.close()
-    except Exception: pass
+    except Exception:
+        pass
 
     try:
-        plt.figure(figsize=(5.8,3.4))
+        plt.figure(figsize=(6.2,3.4))
         plt.hist(scores[y_true==0], bins=60, alpha=.7, label="neg", density=True)
         plt.hist(scores[y_true==1], bins=60, alpha=.7, label="pos", density=True)
         plt.legend(); plt.grid(alpha=.2); plt.title(f"Score dist - {prefix}")
         plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"hist_{prefix}.png"), dpi=130); plt.close()
-    except Exception: pass
+    except Exception:
+        pass
 
     return auc, ap
 
@@ -436,6 +488,8 @@ def _score_one(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int,
             for h in templates_host:
                 s = ncc_fft_max(x, h, max_shift_samp=max_shift, lag_step=lag_step, use_gpu=False)
                 if s > best: best = s
+        if not np.isfinite(best):
+            return 0.0
         return best
     except Exception:
         return 0.0
@@ -471,13 +525,15 @@ def score_subset(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
     with tqdm(total=n, unit="win", mininterval=CFG.TQDM_MIN_INTERVAL, desc=f"[{name}] NCC", leave=True) as bar:
         for b in batches:
             if use_gpu:
-                # GPU: iterar sequencial (evita overhead e conflitos de contexto)
+                # GPU: sequencial (um por vez) evita overhead e conflitos de contexto
                 out_final = []
                 for i in b:
                     fid = df_sub.at[i, "file_id"]
                     sgps = float(df_sub.at[i, "start_gps"])
                     out_final.append(_score_one(fid, sgps, idx_map, max_shift, lag_step,
                                                 templates_host, True, dev_all))
+                # limpa blocos livres entre batches
+                cp.get_default_memory_pool().free_all_blocks()
             else:
                 # CPU: multiprocess
                 out_final = Parallel(n_jobs=CFG.N_JOBS, backend="loky")(
@@ -496,7 +552,7 @@ def score_subset(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
             if (done % CFG.HEARTBEAT_EVERY_N == 0) or (now - last_hb >= CFG.HEARTBEAT_EVERY_SEC):
                 rate = done / max(now - t0, 1e-9)
                 eta  = (n - done) / max(rate, 1e-9)
-                print(f"  [hb] {name}: {done:,}/{n:,} ({100*done/n:.1f}%)  {rate:.1f} win/s  ETA {eta/60:.1f} min")
+                print(f"  [hb] {name}: {done:,}/{n:,} ({100*done/n:.1f}%)  {rate:.1f} win/s  ETA {eta/60:.1f} min", flush=True)
                 last_hb = now
 
     _log(f"      [{name}] tempo={time.time()-t0:.1f}s | ~{(n/max(time.time()-t0,1e-9)):.1f} win/s")
@@ -552,14 +608,21 @@ def main():
     tmpl_cache = maybe_load_template_cache(out_dir, bank)
     total_templates = len(tmpl_cache)
 
-    # Self-test rápido (injeção) em CPU — sanity check
+    # Self-test rápido (injeção) — sanity check (DOT vs FFT)
     rng = np.random.default_rng(42)
     k0  = next(iter(tmpl_cache.keys()))
     h   = tmpl_cache[k0]
     x   = h + 0.25 * rng.standard_normal(h.size).astype(np.float32)
     x   = (x - x.mean()) / (x.std() + 1e-12)
-    peak = _ncc_fft_max_cpu(x, h, max_shift_samp=int(CFG.MAX_SHIFT_SEC*CFG.FS_TARGET), lag_step=max(1, CFG.LAG_STEP))
-    _log(f"[DEBUG] Self-test NCC (CPU): {peak:.4f} (esperado ≳ 0.05–0.2)")
+    peak_fft = _ncc_fft_max_cpu(
+        x, h,
+        max_shift_samp=int(max(1, CFG.MAX_SHIFT_SEC*CFG.FS_TARGET)),
+        lag_step=max(1, CFG.LAG_STEP)
+    )
+    peak_dot = _ncc_dot_ref(x, h)
+    _log(f"[DEBUG] Self-test NCC: DOT={peak_dot:.4f} | FFT={peak_fft:.4f} (esperado ≳ 0.05–0.2)")
+    if peak_dot > 0.1 and peak_fft < 0.02:
+        _log("[WARN] FFT NCC muito baixo vs DOT → verifique centragem/lag_step/max_shift/normalização.")
 
     # 3) VAL
     _log("[3/6] Scoring VAL …")
@@ -569,6 +632,9 @@ def main():
     _log("[4/6] Thresholds no VAL …")
     y_val = df_val["label"].to_numpy(int)
     thr, info = pick_threshold(y_val, s_val)
+    _log(f"[VAL] scores: min={s_val.min():.3g} med={np.median(s_val):.3g} max={s_val.max():.3g} | frac(>1e-6)={(s_val>1e-6).mean():.3%}")
+    if thr <= 0.0:
+        _log("[WARN] Limiar calculado <= 0; verifique distribuição de scores/normalização.")
     auc_val, ap_val = summarize_and_plot(y_val, s_val, out_dir, "val")
     df_val_out = df_val.copy(); df_val_out["score"] = s_val
     df_val_out.to_csv(os.path.join(out_dir, "scores_val.csv"), index=False)
@@ -578,6 +644,7 @@ def main():
     s_test = score_subset("TEST", df_test, idx_map, tmpl_cache)
     y_test = df_test["label"].to_numpy(int)
     auc_test, ap_test = summarize_and_plot(y_test, s_test, out_dir, "test")
+    _log(f"[TEST] scores: min={s_test.min():.3g} med={np.median(s_test):.3g} max={s_test.max():.3g} | frac(>1e-6)={(s_test>1e-6).mean():.3%}")
     df_test_out = df_test.copy(); df_test_out["score"] = s_test
     df_test_out.to_csv(os.path.join(out_dir, "scores_test.csv"), index=False)
 
