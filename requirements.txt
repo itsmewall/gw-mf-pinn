@@ -7,3 +7,5 @@ pandas==2.2.2
 scikit-learn==1.5.1 
 pycbc==2.2.3 
 jupyterlab==4.2.1 
+pybind11>=3.0.1
+cppimport>=22.8.2

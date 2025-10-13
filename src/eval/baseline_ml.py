@@ -1,24 +1,20 @@
 """
-baseline_ml.py  —  versão otimizada
--------------------------------------------------------
-Detecção de janelas com sinal GW usando ML clássico (LogReg ou RandomForest).
-
-Melhorias:
-  • Downsampling de negativos no treino (controla desbalanceamento + acelera).
-  • Calibração opcional de probabilidades (CalibratedClassifierCV).
-  • Escolha de limiar por 'best_f1' + grade por FAR (0.1%, 0.5%, 1%, 2%, 5%).
-  • Relatórios completos: metrics.json, thresholds.json, ROC/PR, confusão,
-    importâncias/coeficientes e dump de scores do teste.
-  • Logs de progresso com tempos.
-  • FIX: transformador log1p agora é "picklável" (função top-level com índices).
+baseline_ml.py — robusto (autogerador de split) e picklável.
+- Se 'split' não existir no dataset.parquet, cria split por grupos (file_id):
+  train/val/test = 70/15/15 com GroupShuffleSplit (sem vazamento entre janelas).
+- Downsampling de negativos no treino.
+- Calibração opcional.
+- Thresholds por best_f1 e por FAR grid.
+- Salva métricas, plots, scores_test e model.joblib (com asdict(CFG)).
+- Se criar split, escreve data/processed/dataset_with_split.parquet.
 
 Requisitos:
-  pip install pandas numpy scikit-learn matplotlib seaborn pyarrow joblib
+  pip install pandas numpy scikit-learn matplotlib seaborn pyarrow joblib tqdm
 """
 
 from __future__ import annotations
 import os, json, time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Tuple, Dict, Optional, List
 
 import numpy as np
@@ -33,6 +29,8 @@ try:
 except Exception:
     pass
 
+from tqdm import tqdm
+
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
@@ -44,6 +42,7 @@ from sklearn.metrics import (
     roc_curve, precision_recall_curve,
     confusion_matrix, classification_report
 )
+from sklearn.model_selection import GroupShuffleSplit
 import joblib
 
 
@@ -53,6 +52,7 @@ import joblib
 @dataclass(frozen=True)
 class Cfg:
     DATASET: str = os.path.join("data", "processed", "dataset.parquet")
+    DATASET_WITH_SPLIT: str = os.path.join("data", "processed", "dataset_with_split.parquet")
     OUT_DIR: str = os.path.join("reports", "baseline_ml")
 
     MODEL: str = "logreg"    # "logreg" | "rf"
@@ -75,7 +75,7 @@ class Cfg:
     NUM_COLS: tuple = ("snr_rms", "snr_peak", "crest_factor", "window_sec", "stride_sec")
     CAT_COLS: tuple = ("detector",)
 
-    # aplicar log1p apenas nestas numéricas (por índice)
+    # aplicar log1p apenas nestas numéricas (por nome)
     APPLY_LOG1P_ON: tuple = ("snr_rms", "snr_peak", "crest_factor")
 
     # ---- Estratégias de threshold
@@ -84,7 +84,7 @@ class Cfg:
     FAR_GRID: tuple = (0.001, 0.005, 0.01, 0.02, 0.05)
 
     # ---- Calibração
-    CALIBRATE_PROBA: bool = True      # bom p/ RF
+    CALIBRATE_PROBA: bool = True      # bom p/ RF e às vezes p/ LogReg
 
     # ---- Downsampling de negativos no TREINO
     ENABLE_NEG_DOWNSAMPLE: bool = True
@@ -104,6 +104,71 @@ def ts_now() -> str:
 
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
+
+# =========================
+# Split helpers
+# =========================
+REQUIRED_COLS = {"label", *CFG.NUM_COLS, *CFG.CAT_COLS}
+
+def _need_split(df: pd.DataFrame) -> bool:
+    return "split" not in df.columns
+
+def _check_required_cols(df: pd.DataFrame):
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Dataset missing required columns: {missing}. "
+                         f"Columns present: {list(df.columns)[:20]}...")
+
+def _ensure_group_col(df: pd.DataFrame) -> pd.Series:
+    # preferir file_id; se não houver, use event_hint; senão, cria grupo por arquivo lógico (start_gps+detector)
+    if "file_id" in df.columns:
+        g = df["file_id"].astype(str)
+    elif "event_hint" in df.columns:
+        g = df["event_hint"].astype(str)
+    else:
+        base = (df.get("start_gps", pd.Series(index=df.index, data=-1)).astype(str) +
+                "_" + df.get("detector", pd.Series(index=df.index, data="UNK")).astype(str))
+        g = base
+    return g
+
+def _assign_split_groups(df: pd.DataFrame, seed: int = 42) -> pd.Series:
+    """Cria uma coluna 'split' por grupos (sem vazamento entre janelas)."""
+    groups = _ensure_group_col(df)
+    idx = np.arange(len(df))
+
+    # 1) train vs temp (val+test)
+    gss = GroupShuffleSplit(n_splits=1, train_size=0.70, random_state=seed)
+    tr_idx, temp_idx = next(gss.split(idx, groups=groups))
+    # 2) temp -> val vs test (50/50 do temp -> 15/15 geral)
+    temp_groups = groups.iloc[temp_idx]
+    gss2 = GroupShuffleSplit(n_splits=1, train_size=0.50, random_state=seed+1)
+    va_rel, te_rel = next(gss2.split(temp_idx, groups=temp_groups))
+    va_idx = temp_idx[va_rel]
+    te_idx = temp_idx[te_rel]
+
+    split = pd.Series(index=df.index, data="", dtype="object")
+    split.iloc[tr_idx] = "train"
+    split.iloc[va_idx] = "val"
+    split.iloc[te_idx] = "test"
+    return split
+
+def ensure_splits(df: pd.DataFrame, save_sidecar: bool = True) -> pd.DataFrame:
+    _check_required_cols(df)
+    if not _need_split(df):
+        return df
+    _log("[SPLIT] Coluna 'split' ausente — gerando via GroupShuffleSplit (por grupo/file_id).")
+    df = df.copy()
+    df["split"] = _assign_split_groups(df, seed=CFG.SEED).values
+    # feedback rápido
+    ct = df["split"].value_counts().to_dict()
+    _log(f"[SPLIT] Feito: train={ct.get('train',0):,}  val={ct.get('val',0):,}  test={ct.get('test',0):,}")
+    if save_sidecar:
+        try:
+            df.to_parquet(CFG.DATASET_WITH_SPLIT, index=False)
+            _log(f"[SPLIT] Sidecar salvo em: {CFG.DATASET_WITH_SPLIT}")
+        except Exception as e:
+            _log(f"[SPLIT] Aviso: falha ao salvar sidecar: {e}")
+    return df
 
 # =========================
 # Data utils
@@ -139,10 +204,6 @@ def downsample_train(train_df: pd.DataFrame) -> pd.DataFrame:
 # Transformações numéricas (TOP-LEVEL, picklável)
 # =========================
 def _log1p_indices(X: np.ndarray, indices: tuple) -> np.ndarray:
-    """
-    Aplica log1p apenas nas colunas (por índice) informadas.
-    Recebe e retorna np.ndarray — compatível com ColumnTransformer.
-    """
     X = np.asarray(X, dtype=float)
     X_out = X.copy()
     if len(indices) > 0:
@@ -150,7 +211,6 @@ def _log1p_indices(X: np.ndarray, indices: tuple) -> np.ndarray:
     return X_out
 
 def make_numeric_transform():
-    # mapeia nomes -> índices dentro de NUM_COLS
     idx = tuple(i for i, c in enumerate(CFG.NUM_COLS) if c in CFG.APPLY_LOG1P_ON)
     log_step = FunctionTransformer(
         func=_log1p_indices,
@@ -222,31 +282,45 @@ def safe_proba(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
 # Thresholding
 # =========================
 def find_threshold_best_f1(y_true: np.ndarray, y_score: np.ndarray):
-    thresholds = np.unique(np.clip(y_score, 0.0, 1.0))
-    thresholds = np.concatenate(([0.0], thresholds, [1.0]))
-    best_thr, best_f1, best_stats = 0.5, -1.0, {}
-    for thr in thresholds:
-        yp = (y_score >= thr).astype(np.uint8)
-        tn, fp, fn, tp = confusion_matrix(y_true, yp, labels=[0,1]).ravel()
+    y_true = y_true.astype(np.uint8, copy=False)
+    yq = np.round(np.clip(y_score, 0.0, 1.0), 4)
+    thr = np.unique(np.concatenate(([0.0], yq, [1.0])))
+
+    order = np.argsort(-yq, kind="mergesort")
+    yt = y_true[order]
+    scores_sorted = yq[order]
+    tp_pref = np.cumsum(yt == 1)
+    fp_pref = np.cumsum(yt == 0)
+    n_pos = int((y_true == 1).sum())
+
+    best_f1, best_thr, best_stats = -1.0, 0.5, {}
+    for t in tqdm(thr, desc="[VAL] threshold scan (best_f1)", unit="thr", leave=False):
+        i = np.searchsorted(-scores_sorted, -t, side="right") - 1
+        if i < 0:
+            tp = 0; fp = 0
+        else:
+            tp = int(tp_pref[i]); fp = int(fp_pref[i])
+        fn = n_pos - tp
         prec = tp / max(tp + fp, 1); rec = tp / max(tp + fn, 1)
         f1 = 2 * prec * rec / max(prec + rec, 1e-12)
         if f1 > best_f1:
-            best_f1, best_thr = f1, thr
+            best_f1, best_thr = f1, float(t)
             best_stats = {"f1": f1, "precision": prec, "recall": rec,
-                          "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+                          "tn": None, "fp": fp, "fn": fn, "tp": tp}
     return float(best_thr), best_stats
 
 def find_threshold_by_far(y_true: np.ndarray, y_score: np.ndarray, far: float):
-    order = np.argsort(-y_score)
-    y_true_sorted = y_true[order]
-    y_score_sorted = y_score[order]
-    n0 = int((y_true==0).sum()); n1 = int((y_true==1).sum())
+    order = np.argsort(-y_score, kind="mergesort")
+    yt = y_true[order]
+    ys = y_score[order]
+    n0 = int((y_true == 0).sum())
+    n1 = int((y_true == 1).sum())
+
     fp = 0; tp = 0
-    thr = 1.0
     best = {"threshold": 1.0, "fpr": 0.0, "tpr": 0.0, "precision": 1.0, "recall": 0.0}
-    for i in range(len(y_score_sorted)):
-        thr = y_score_sorted[i]
-        if y_true_sorted[i] == 1: tp += 1
+    for i in tqdm(range(len(ys)), desc=f"[VAL] FAR≤{far:.3%}", unit="cut", leave=False):
+        thr = ys[i]
+        if yt[i] == 1: tp += 1
         else: fp += 1
         fpr = fp / max(n0, 1); tpr = tp / max(n1, 1)
         prec = tp / max(tp + fp, 1); rec = tpr
@@ -312,6 +386,10 @@ def main():
     assert os.path.exists(CFG.DATASET), f"Dataset não encontrado: {CFG.DATASET}"
     _log("[1/6] Lendo dataset…")
     df = pd.read_parquet(CFG.DATASET)
+
+    # --- NOVO: garante 'split' se faltar ---
+    df = ensure_splits(df, save_sidecar=True)
+
     tr, va, te = split_sets(df)
     _log(f"   • train={len(tr):,}  val={len(va):,}  test={len(te):,}")
 
@@ -333,6 +411,7 @@ def main():
 
     _log("[5/6] Avaliando e escolhendo limiares (val)…")
     p_va = safe_proba(pipe, Xva)
+    print(f"   • val: y=1 -> {(yva==1).sum()} | y=0 -> {(yva==0).sum()} | scores[min/med/max]=({p_va.min():.4g}/{np.median(p_va):.4g}/{p_va.max():.4g})")
     thr_best_f1, stats_best = find_threshold_best_f1(yva, p_va)
     far_thresholds = {}
     for far in CFG.FAR_GRID:
@@ -396,7 +475,6 @@ def main():
         pass
 
     try:
-        # dump de scores do teste
         dump_cols = ["file_id", "event_hint", "detector", "start_gps",
                      "window_sec", "stride_sec", "snr_rms", "snr_peak", "crest_factor", "label"]
         subset = te[dump_cols].copy()
@@ -406,9 +484,10 @@ def main():
     except Exception:
         pass
 
-    # salva modelo (agora 100% picklável)
-    joblib.dump({"pipeline": pipe, "threshold": float(thr_main), "cfg": CFG.__dict__},
-                os.path.join(out_dir, "model.joblib"))
+    # salva modelo (agora picklável)
+    joblib.dump({"pipeline": pipe, "threshold": float(thr_main), "cfg": asdict(CFG)},
+                os.path.join(out_dir, "model.joblib"),
+                compress=3)
 
     _log("\n[OK] Baseline otimizado concluído.")
     _log(f" Saída: {out_dir}")

@@ -32,8 +32,8 @@ from eval import mf_baseline as mbf
 # ============================================================
 # TOGGLES — ligue/desligue estágios
 # ============================================================
-ENABLE_DOWNLOAD      = True   # baixa GWOSC (quota controlada)
-ENABLE_WHITEN        = True   # pré-processa (bandpass/PSD/whiten) só novos
+ENABLE_DOWNLOAD      = False   # baixa GWOSC (quota controlada)
+ENABLE_WHITEN        = False   # pré-processa (bandpass/PSD/whiten) só novos
 ENABLE_WINDOWS       = True    # gera janelas/SNR só novos
 ENABLE_DATASET       = True    # recria dataset.parquet
 ENABLE_BASELINE_ML   = True    # roda baseline_ml.py
