@@ -1,9 +1,10 @@
 # src/eval/mf_baseline.py
 # --------------------------------------------------------------------------------------
-# Matched-filter baseline via NCC com FFT, rápido e estável:
+# Matched-filter baseline via NCC com FFT:
+# - GPU via CuPy (cuFFT cp.fft) com fallback automático para CPU (SciPy)
 # - Index de windows por file_id (1x por run)
 # - Cache de start_gps/start_idx por arquivo
-# - Paralelismo por janelas (joblib)
+# - Paralelismo por janelas (joblib) — CPU apenas; GPU roda single-process
 # - Restrições de lag (±MAX_SHIFT_SEC) + passo LAG_STEP
 # - Subamostragem de templates + cache .npz
 # - Compatível com dataset que use 'split' OU 'subset'
@@ -30,10 +31,30 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
-from scipy.signal import resample_poly, fftconvolve, get_window
+# FFT (CPU)
+from scipy.signal import resample_poly, get_window, fftconvolve as np_fftconvolve
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
 
 from pycbc.waveform import get_td_waveform
+
+# =========================
+# GPU (CuPy) autodetect — sem cupyx
+# =========================
+_HAS_CUPY = False
+_CUPY_ERR = None
+try:
+    import cupy as cp
+    try:
+        n_gpus = cp.cuda.runtime.getDeviceCount()
+        # valida cuFFT rapidamente
+        _ = cp.fft.rfft(cp.zeros(8, dtype=cp.float32))
+        _HAS_CUPY = (n_gpus > 0)
+    except Exception as e:
+        _CUPY_ERR = f"cuFFT indisponível: {e}"
+        _HAS_CUPY = False
+except Exception as e:
+    _CUPY_ERR = f"CuPy indisponível: {e}"
+    _HAS_CUPY = False
 
 
 # =========================
@@ -50,9 +71,13 @@ class CFG:
     WINDOW_SEC: float = 2.0
     FS_TARGET: int    = 4096
 
+    # GPU
+    USE_GPU: bool = True                    # tenta GPU; cai para CPU se indisponível
+    GPU_TEMPLATES_PER_CHUNK: int = 999_999  # manter todos por padrão
+
     # banco de templates
-    TEMPLATES_N: int = 256
-    TEMPLATE_SUBSAMPLE: int = 2       # usa 1 a cada K (2 => ~128)
+    TEMPLATES_N: int = 64                   # reduza/eleve conforme VRAM
+    TEMPLATE_SUBSAMPLE: int = 1             # usa 1 a cada K
     M1_RANGE: Tuple[float, float] = (5.0, 40.0)
     M2_RANGE: Tuple[float, float] = (5.0, 40.0)
     SPIN1: float = 0.0
@@ -62,22 +87,22 @@ class CFG:
     CACHE_FILE: str = "templates_cache.npz"
 
     # lags
-    MAX_SHIFT_SEC: float = 0.25        # busca pico só em ±0.25 s
-    LAG_STEP: int = 8                  # salta lags (8, 16 …) acelera bem
+    MAX_SHIFT_SEC: float = 0.10             # ±0.10 s p/ acelerar
+    LAG_STEP: int = 32                       # stride nos lags
 
     # limites (aceleração controlada; mantenha None p/ full)
     MAX_VAL_ROWS: Optional[int] = None
     MAX_TEST_ROWS: Optional[int] = None
 
     # threshold
-    MODE: str = "target_far"           # "target_far" ou "best_f1"
+    MODE: str = "target_far"                # "target_far" ou "best_f1"
     TARGET_FAR: float = 1e-6
 
     # saída
     OUT_DIR_ROOT: str = "reports/mf_baseline"
 
     # paralelismo
-    N_JOBS: int = max(os.cpu_count() - 1, 1)
+    N_JOBS: int = max(os.cpu_count() - 1, 1)  # CPU only; GPU usa 1
     BATCH_SZ: int = 256
 
     # feedback
@@ -122,7 +147,7 @@ def build_windows_index(windows_dir: str) -> Dict[str, str]:
     idx: Dict[str, str] = {}
     for p in glob(os.path.join(windows_dir, "**", "*_windows.hdf5"), recursive=True):
         fid = os.path.basename(p)
-        idx[fid] = p
+        idx[fid] = os.path.abspath(p)
     return idx
 
 @lru_cache(maxsize=256)
@@ -149,10 +174,9 @@ def resolve_whitened_path(win_path: str, meta_in: Dict[str, str]) -> Optional[st
         os.path.join("data/processed", bn),
     ]
     for p in candidates:
-        if os.path.exists(p):
-            return p
+        if os.path.exists(p): return os.path.abspath(p)
     hits = glob(f"data/**/{bn}", recursive=True)
-    return hits[0] if hits else None
+    return os.path.abspath(hits[0]) if hits else None
 
 
 # =========================
@@ -263,18 +287,48 @@ def load_window_slice(win_path: str, whitened_path: str, start_gps: float) -> Op
 # =========================
 # NCC via FFT com restrição de lags
 # =========================
-def ncc_fft_max(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int) -> float:
-    # correlação "full"
-    c = fftconvolve(x, h[::-1], mode="full")
-    # normalização simples (mesmo tamanho de janela)
+def _ncc_fft_max_cpu(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int) -> float:
+    c = np_fftconvolve(x, h[::-1], mode="full")
     denom = (np.linalg.norm(x) * np.linalg.norm(h)) + 1e-12
     c = c / denom
-
     L = c.size
     center = L // 2
     lo = max(0, center - max_shift_samp)
     hi = min(L, center + max_shift_samp + 1)
     return float(np.nanmax(c[lo:hi:lag_step]))
+
+def _ncc_fft_max_gpu(x_host: np.ndarray, h_dev, max_shift_samp: int, lag_step: int) -> float:
+    # x_host: numpy no host; h_dev: cupy já no device (float32)
+    x_dev = cp.asarray(x_host, dtype=cp.float32)
+
+    # full convolution via FFT: conv(x, h_rev)
+    n_full = int(x_dev.size + h_dev.size - 1)
+    nfft = 1 << (int((n_full - 1).bit_length()))  # próxima potência de 2
+    X = cp.fft.rfft(x_dev, nfft)
+    H = cp.fft.rfft(h_dev[::-1], nfft)
+    c = cp.fft.irfft(X * cp.conj(H), nfft)[:n_full]
+
+    denom = (cp.linalg.norm(x_dev) * cp.linalg.norm(h_dev)) + 1e-12
+    c = c / denom
+
+    L = int(c.size)
+    center = L // 2
+    lo = max(0, int(center - max_shift_samp))
+    hi = min(L, int(center + max_shift_samp + 1))
+    m = cp.nanmax(c[lo:hi:lag_step])
+    val = float(m.get())
+
+    del X, H, c, x_dev, m
+    cp.get_default_memory_pool().free_all_blocks()
+    return val
+
+def ncc_fft_max(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int,
+                use_gpu: bool = False, h_dev=None) -> float:
+    if use_gpu and _HAS_CUPY:
+        if h_dev is None:
+            h_dev = cp.asarray(h, dtype=cp.float32)
+        return _ncc_fft_max_gpu(x, h_dev, max_shift_samp, lag_step)
+    return _ncc_fft_max_cpu(x, h, max_shift_samp, lag_step)
 
 
 # =========================
@@ -356,10 +410,11 @@ def confusion_at_threshold(y_true: np.ndarray, scores: np.ndarray, thr: float):
 
 
 # =========================
-# Scoring paralelizado
+# Scoring (CPU/GPU) paralelizado por janelas
 # =========================
 def _score_one(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int,
-               lag_step: int, templates: List[np.ndarray]) -> float:
+               lag_step: int, templates_host: List[np.ndarray],
+               use_gpu: bool, dev_all: Optional[List] = None) -> float:
     win_path = idx_map.get(fid)
     if not win_path: return 0.0
     # cache meta e resolve whitened
@@ -371,9 +426,16 @@ def _score_one(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int,
         x = load_window_slice(win_path, wht, float(sgps))
         if x is None or not np.any(np.isfinite(x)): return 0.0
         best = 0.0
-        for h in templates:
-            s = ncc_fft_max(x, h, max_shift_samp=max_shift, lag_step=lag_step)
-            if s > best: best = s
+        if use_gpu and _HAS_CUPY and dev_all is not None:
+            # percorre templates no device (dev_all) com seus pares host
+            for h_dev, h_host in zip(dev_all, templates_host):
+                s = ncc_fft_max(x, h_host, max_shift_samp=max_shift, lag_step=lag_step,
+                                use_gpu=True, h_dev=h_dev)
+                if s > best: best = s
+        else:
+            for h in templates_host:
+                s = ncc_fft_max(x, h, max_shift_samp=max_shift, lag_step=lag_step, use_gpu=False)
+                if s > best: best = s
         return best
     except Exception:
         return 0.0
@@ -384,7 +446,7 @@ def score_subset(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
     keys = list(tmpl_cache.keys())
     if CFG.TEMPLATE_SUBSAMPLE > 1:
         keys = keys[::CFG.TEMPLATE_SUBSAMPLE]
-    templates = [tmpl_cache[k] for k in keys]
+    templates_host = [tmpl_cache[k] for k in keys]  # numpy no host
 
     fs = CFG.FS_TARGET
     max_shift = int(round(CFG.MAX_SHIFT_SEC * fs))
@@ -393,23 +455,41 @@ def score_subset(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
     n = len(df_sub)
     scores = np.zeros(n, np.float32)
 
-    _log(f"[{name}] janelas={n:,} | templates={len(templates)} | max_shift={CFG.MAX_SHIFT_SEC:.3f}s | lag_step={lag_step} | jobs={CFG.N_JOBS}")
+    use_gpu = bool(CFG.USE_GPU and _HAS_CUPY)
+    _log(f"[{name}] janelas={n:,} | templates={len(templates_host)} | max_shift={CFG.MAX_SHIFT_SEC:.3f}s | lag_step={lag_step} | jobs={CFG.N_JOBS if not use_gpu else 1} | GPU={use_gpu}")
 
-    # paraleliza por lotes de BATCH_SZ para reduzir overhead
+    # sobe TODOS os templates para a GPU uma vez (se GPU ativa)
+    dev_all = None
+    if use_gpu:
+        dev_all = [cp.asarray(h, dtype=cp.float32) for h in templates_host]
+        cp.get_default_memory_pool().free_all_blocks()
+
     idx = df_sub.index.to_list()
     batches = [idx[i:i+CFG.BATCH_SZ] for i in range(0, n, CFG.BATCH_SZ)]
 
     t0 = time.time(); last_hb = t0; done = 0
     with tqdm(total=n, unit="win", mininterval=CFG.TQDM_MIN_INTERVAL, desc=f"[{name}] NCC", leave=True) as bar:
         for b in batches:
-            out = Parallel(n_jobs=CFG.N_JOBS, backend="loky")(
-                delayed(_score_one)(
-                    df_sub.at[i, "file_id"],
-                    float(df_sub.at[i, "start_gps"]),
-                    idx_map, max_shift, lag_step, templates
-                ) for i in b
-            )
-            scores[ [df_sub.index.get_loc(i) for i in b] ] = out
+            if use_gpu:
+                # GPU: iterar sequencial (evita overhead e conflitos de contexto)
+                out_final = []
+                for i in b:
+                    fid = df_sub.at[i, "file_id"]
+                    sgps = float(df_sub.at[i, "start_gps"])
+                    out_final.append(_score_one(fid, sgps, idx_map, max_shift, lag_step,
+                                                templates_host, True, dev_all))
+            else:
+                # CPU: multiprocess
+                out_final = Parallel(n_jobs=CFG.N_JOBS, backend="loky")(
+                    delayed(_score_one)(
+                        df_sub.at[i, "file_id"],
+                        float(df_sub.at[i, "start_gps"]),
+                        idx_map, max_shift, lag_step,
+                        templates_host, False, None
+                    ) for i in b
+                )
+
+            scores[ [df_sub.index.get_loc(i) for i in b] ] = out_final
             done += len(b); bar.update(len(b))
 
             now = time.time()
@@ -460,6 +540,7 @@ def main():
     if CFG.MAX_TEST_ROWS: df_test = df_test.head(CFG.MAX_TEST_ROWS).copy()
 
     _log(f"[1/6] Dataset OK: val={len(df_val):,} | test={len(df_test):,}")
+    _log(f"[GPU] solicitado={CFG.USE_GPU} | disponível={_HAS_CUPY}" + (f" | nota={_CUPY_ERR}" if (_CUPY_ERR and not _HAS_CUPY) else ""))
 
     # 2) Index de windows (1x) e banco de templates
     _log("[2/6] Indexando *_windows.hdf5 …")
@@ -471,14 +552,14 @@ def main():
     tmpl_cache = maybe_load_template_cache(out_dir, bank)
     total_templates = len(tmpl_cache)
 
-    # Self-test rápido (injeção)
+    # Self-test rápido (injeção) em CPU — sanity check
     rng = np.random.default_rng(42)
     k0  = next(iter(tmpl_cache.keys()))
     h   = tmpl_cache[k0]
     x   = h + 0.25 * rng.standard_normal(h.size).astype(np.float32)
     x   = (x - x.mean()) / (x.std() + 1e-12)
-    peak = ncc_fft_max(x, h, max_shift_samp=int(CFG.MAX_SHIFT_SEC*CFG.FS_TARGET), lag_step=max(1, CFG.LAG_STEP))
-    _log(f"[DEBUG] Self-test NCC: {peak:.4f} (esperado ≳ 0.05–0.2)")
+    peak = _ncc_fft_max_cpu(x, h, max_shift_samp=int(CFG.MAX_SHIFT_SEC*CFG.FS_TARGET), lag_step=max(1, CFG.LAG_STEP))
+    _log(f"[DEBUG] Self-test NCC (CPU): {peak:.4f} (esperado ≳ 0.05–0.2)")
 
     # 3) VAL
     _log("[3/6] Scoring VAL …")
@@ -512,13 +593,14 @@ def main():
         "threshold": float(thr),
         "threshold_info": info,
         "out_dir": out_dir,
+        "gpu": {"requested": bool(CFG.USE_GPU), "available": bool(_HAS_CUPY), "note": _CUPY_ERR}
     }
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
     _log("\n[OK] MF (NCC-FFT) concluído.")
     _log(f" Saída: {out_dir}")
-    _log(f" Templates: {total_templates} | fs={CFG.FS_TARGET} Hz | lag_step={CFG.LAG_STEP} | ±shift={CFG.MAX_SHIFT_SEC}s")
+    _log(f" Templates: {total_templates} | fs={CFG.FS_TARGET} Hz | lag_step={CFG.LAG_STEP} | ±shift={CFG.MAX_SHIFT_SEC}s | GPU={CFG.USE_GPU and _HAS_CUPY}")
     _log(f" Val AUC={auc_val:.4g} AP={ap_val:.4g} | Test AUC={auc_test:.4g} AP={ap_test:.4g}")
     _log(f" Confusion@test_thr: tn={tn} fp={fp} fn={fn} tp={tp}")
     _log(f" Tempo total: {time.time()-t_all:.1f}s")

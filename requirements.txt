@@ -9,3 +9,7 @@ pycbc==2.2.3
 jupyterlab==4.2.1 
 pybind11>=3.0.1
 cppimport>=22.8.2
+xgboost>=3.0.5
+cupy-cuda12x
+nvidia-curand-cu12
+nvidia-cufft-cu12

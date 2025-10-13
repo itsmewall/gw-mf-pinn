@@ -1,16 +1,19 @@
-"""
-baseline_ml.py — robusto (autogerador de split) e picklável.
-- Se 'split' não existir no dataset.parquet, cria split por grupos (file_id):
-  train/val/test = 70/15/15 com GroupShuffleSplit (sem vazamento entre janelas).
-- Downsampling de negativos no treino.
-- Calibração opcional.
-- Thresholds por best_f1 e por FAR grid.
-- Salva métricas, plots, scores_test e model.joblib (com asdict(CFG)).
-- Se criar split, escreve data/processed/dataset_with_split.parquet.
-
-Requisitos:
-  pip install pandas numpy scikit-learn matplotlib seaborn pyarrow joblib tqdm
-"""
+# src/eval/baseline_ml.py
+# -------------------------------------------------------------------------------------------------
+# Baseline ML (CPU por padrão) com opção de GPU via XGBoost:
+# - Gera 'split' por grupos (file_id) se não existir (70/15/15) sem vazamento entre janelas
+# - Downsampling de negativos no treino
+# - Calibração opcional (sigmoid)
+# - Estratégias de limiar: best_f1 e FAR grid
+# - Salva métricas, plots, scores_test e model.joblib (com asdict(CFG))
+# - Se criar split, escreve data/processed/dataset_with_split.parquet
+#
+# Requisitos:
+#   pip install pandas numpy scikit-learn matplotlib seaborn pyarrow joblib tqdm
+#   (opcional, GPU) pip install xgboost>=2.0
+#
+# Para usar GPU: defina CFG.MODEL="xgb". O XGBoost usará CUDA com tree_method="gpu_hist".
+# -------------------------------------------------------------------------------------------------
 
 from __future__ import annotations
 import os, json, time
@@ -45,6 +48,13 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupShuffleSplit
 import joblib
 
+# XGBoost (opcional; só necessário se MODEL="xgb")
+try:
+    import xgboost as xgb
+    _HAS_XGB = True
+except Exception:
+    _HAS_XGB = False
+
 
 # =========================
 # CONFIG
@@ -55,7 +65,8 @@ class Cfg:
     DATASET_WITH_SPLIT: str = os.path.join("data", "processed", "dataset_with_split.parquet")
     OUT_DIR: str = os.path.join("reports", "baseline_ml")
 
-    MODEL: str = "logreg"    # "logreg" | "rf"
+    # MODEL: "logreg" | "rf" | "xgb" (GPU via XGBoost)
+    MODEL: str = "xgb"
     SEED: int = 42
     VERBOSE: bool = True
 
@@ -71,6 +82,20 @@ class Cfg:
     RF_N_JOBS: int = -1
     RF_CLASS_WEIGHT: Optional[str] = "balanced_subsample"
 
+    # ---- XGBoost (GPU)
+    XGB_N_EST: int = 800
+    XGB_MAX_DEPTH: int = 8
+    XGB_LR: float = 0.05
+    XGB_SUBSAMPLE: float = 0.8
+    XGB_COLSAMPLE: float = 0.8
+    XGB_REG_L1: float = 0.0
+    XGB_REG_L2: float = 1.0
+    XGB_MAX_BIN: int = 256
+    XGB_EVAL_METRIC: str = "auc"
+    XGB_TREE_METHOD: str = "gpu_hist"    # "gpu_hist" para GPU, "hist" para CPU
+    XGB_PREDICTOR: str = "gpu_predictor" # "gpu_predictor" ou "auto"
+    XGB_N_JOBS: int = 0                  # 0 = deixe a GPU trabalhar
+
     # ---- Features
     NUM_COLS: tuple = ("snr_rms", "snr_peak", "crest_factor", "window_sec", "stride_sec")
     CAT_COLS: tuple = ("detector",)
@@ -84,13 +109,14 @@ class Cfg:
     FAR_GRID: tuple = (0.001, 0.005, 0.01, 0.02, 0.05)
 
     # ---- Calibração
-    CALIBRATE_PROBA: bool = True      # bom p/ RF e às vezes p/ LogReg
+    CALIBRATE_PROBA: bool = True      # bom p/ RF e às vezes p/ LogReg/XGB
 
     # ---- Downsampling de negativos no TREINO
     ENABLE_NEG_DOWNSAMPLE: bool = True
     MAX_NEG_PER_POS: int = 50
 
 CFG = Cfg()
+
 
 # =========================
 # Logging helpers
@@ -104,6 +130,7 @@ def ts_now() -> str:
 
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
+
 
 # =========================
 # Split helpers
@@ -159,7 +186,6 @@ def ensure_splits(df: pd.DataFrame, save_sidecar: bool = True) -> pd.DataFrame:
     _log("[SPLIT] Coluna 'split' ausente — gerando via GroupShuffleSplit (por grupo/file_id).")
     df = df.copy()
     df["split"] = _assign_split_groups(df, seed=CFG.SEED).values
-    # feedback rápido
     ct = df["split"].value_counts().to_dict()
     _log(f"[SPLIT] Feito: train={ct.get('train',0):,}  val={ct.get('val',0):,}  test={ct.get('test',0):,}")
     if save_sidecar:
@@ -169,6 +195,7 @@ def ensure_splits(df: pd.DataFrame, save_sidecar: bool = True) -> pd.DataFrame:
         except Exception as e:
             _log(f"[SPLIT] Aviso: falha ao salvar sidecar: {e}")
     return df
+
 
 # =========================
 # Data utils
@@ -200,6 +227,7 @@ def downsample_train(train_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.concat([pos, neg_sample], ignore_index=True).sample(frac=1.0, random_state=CFG.SEED)
     return out
 
+
 # =========================
 # Transformações numéricas (TOP-LEVEL, picklável)
 # =========================
@@ -223,6 +251,7 @@ def make_numeric_transform():
         ("scaler", StandardScaler())
     ])
     return num
+
 
 # =========================
 # Model building
@@ -250,11 +279,38 @@ def build_estimator(model_name: str):
         )
         return CalibratedClassifierCV(base, cv=3, method="sigmoid") if CFG.CALIBRATE_PROBA else base
 
+    if model_name == "xgb":
+        if not _HAS_XGB:
+            raise RuntimeError("XGBoost não instalado. Instale com: pip install xgboost>=2.0")
+        base = xgb.XGBClassifier(
+            n_estimators=CFG.XGB_N_EST,
+            max_depth=CFG.XGB_MAX_DEPTH,
+            learning_rate=CFG.XGB_LR,
+            subsample=CFG.XGB_SUBSAMPLE,
+            colsample_bytree=CFG.XGB_COLSAMPLE,
+            reg_alpha=CFG.XGB_REG_L1,
+            reg_lambda=CFG.XGB_REG_L2,
+            max_bin=CFG.XGB_MAX_BIN,
+            objective="binary:logistic",
+            tree_method=CFG.XGB_TREE_METHOD,     # "gpu_hist" => GPU
+            predictor=CFG.XGB_PREDICTOR,         # "gpu_predictor"
+            eval_metric=CFG.XGB_EVAL_METRIC,
+            random_state=CFG.SEED,
+            n_jobs=CFG.XGB_N_JOBS
+        )
+        # Calibração ajuda a calibrar probas do XGB (opcional)
+        return CalibratedClassifierCV(base, cv=3, method="sigmoid") if CFG.CALIBRATE_PROBA else base
+
     raise ValueError(f"MODEL inválido: {model_name}")
 
 def build_pipeline(model_name: str) -> Pipeline:
     num = make_numeric_transform()
-    cat = Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore"))])
+    # Compat: sklearn>=1.2 usa 'sparse_output'; versões antigas usam 'sparse'
+    try:
+        cat = Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True))])
+    except TypeError:
+        cat = Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore", sparse=True))])
+
     pre = ColumnTransformer(
         transformers=[
             ("num", num, list(CFG.NUM_COLS)),
@@ -277,6 +333,7 @@ def safe_proba(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
         return d
     y = model.predict(X).astype(float)
     return np.clip(y, 0.0, 1.0)
+
 
 # =========================
 # Thresholding
@@ -330,6 +387,7 @@ def find_threshold_by_far(y_true: np.ndarray, y_score: np.ndarray, far: float):
             break
     return float(best["threshold"]), best
 
+
 # =========================
 # Plots + Features
 # =========================
@@ -378,6 +436,7 @@ def feature_names_after_pre(pipe: Pipeline, X_sample: pd.DataFrame) -> List[str]
             out_names += list(oh.get_feature_names_out(cols))
     return out_names
 
+
 # =========================
 # Main
 # =========================
@@ -387,7 +446,7 @@ def main():
     _log("[1/6] Lendo dataset…")
     df = pd.read_parquet(CFG.DATASET)
 
-    # --- NOVO: garante 'split' se faltar ---
+    # --- Garante 'split' se faltar ---
     df = ensure_splits(df, save_sidecar=True)
 
     tr, va, te = split_sets(df)
@@ -484,7 +543,7 @@ def main():
     except Exception:
         pass
 
-    # salva modelo (agora picklável)
+    # salva modelo (picklável)
     joblib.dump({"pipeline": pipe, "threshold": float(thr_main), "cfg": asdict(CFG)},
                 os.path.join(out_dir, "model.joblib"),
                 compress=3)

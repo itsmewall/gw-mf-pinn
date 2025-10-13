@@ -1,0 +1,67 @@
+{
+  "cfg": {
+    "PARQUET_PATH": "data/processed/dataset.parquet",
+    "WINDOWS_DIR": "data/processed",
+    "SUBSETS": [
+      "val",
+      "test"
+    ],
+    "WINDOW_SEC": 2.0,
+    "FS_TARGET": 4096,
+    "USE_GPU": true,
+    "GPU_TEMPLATES_PER_CHUNK": 999999,
+    "TEMPLATES_N": 64,
+    "TEMPLATE_SUBSAMPLE": 1,
+    "M1_RANGE": [
+      5.0,
+      40.0
+    ],
+    "M2_RANGE": [
+      5.0,
+      40.0
+    ],
+    "SPIN1": 0.0,
+    "SPIN2": 0.0,
+    "F_LO": 20.0,
+    "HP_WINDOW_TAPER": 0.1,
+    "CACHE_FILE": "templates_cache.npz",
+    "MAX_SHIFT_SEC": 0.1,
+    "LAG_STEP": 32,
+    "MAX_VAL_ROWS": null,
+    "MAX_TEST_ROWS": null,
+    "MODE": "target_far",
+    "TARGET_FAR": 1e-06,
+    "OUT_DIR_ROOT": "reports/mf_baseline",
+    "N_JOBS": 15,
+    "BATCH_SZ": 256,
+    "HEARTBEAT_EVERY_N": 3000,
+    "HEARTBEAT_EVERY_SEC": 10.0,
+    "TQDM_MIN_INTERVAL": 0.5
+  },
+  "templates_cached": 64,
+  "val": {
+    "auc": 0.5,
+    "ap": 0.00012742438159354808
+  },
+  "test": {
+    "auc": 0.5,
+    "ap": 0.00025484876318709616,
+    "confusion_at_thr": {
+      "tn": 0,
+      "fp": 188299,
+      "fn": 0,
+      "tp": 48
+    }
+  },
+  "threshold": 0.0,
+  "threshold_info": {
+    "mode": "target_far",
+    "far": 1e-06
+  },
+  "out_dir": "reports/mf_baseline/20251013-153057",
+  "gpu": {
+    "requested": true,
+    "available": true,
+    "note": null
+  }
+}

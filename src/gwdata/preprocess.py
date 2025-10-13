@@ -35,6 +35,8 @@ import h5py
 from scipy.signal import butter, filtfilt, iirnotch, welch
 from tqdm import tqdm
 
+from src.accel.whiten import whiten_block
+
 try:
     import yaml  # opcional, só se usar --config
     HAS_YAML = True
@@ -210,8 +212,7 @@ def process_file(in_path: str,
         # Notch lines
         xn = apply_notch_lines(xb, fs=fs, base_hz=notch_base, harmonics=notch_harmonics, Q=30.0)
         # PSD & Whitening
-        f_psd, Pxx = estimate_psd(xn, fs=fs, seg_sec=psd_seg, overlap=psd_overlap)
-        xw = whiten(xn, fs=fs, f_psd=f_psd, Pxx=Pxx)
+        xw = whiten_block(xn, fs=int(fs), psd_sec=psd_seg, use_gpu=True)
 
         # Nome de saída
         base = os.path.basename(in_path)

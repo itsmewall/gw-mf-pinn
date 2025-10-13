@@ -1,0 +1,60 @@
+{
+  "cfg": {
+    "PARQUET_PATH": "data/processed/dataset.parquet",
+    "WINDOWS_DIR": "data/processed",
+    "SUBSETS": [
+      "val",
+      "test"
+    ],
+    "WINDOW_SEC": 2.0,
+    "FS_TARGET": 4096,
+    "TEMPLATES_N": 256,
+    "TEMPLATE_SUBSAMPLE": 2,
+    "M1_RANGE": [
+      5.0,
+      40.0
+    ],
+    "M2_RANGE": [
+      5.0,
+      40.0
+    ],
+    "SPIN1": 0.0,
+    "SPIN2": 0.0,
+    "F_LO": 20.0,
+    "HP_WINDOW_TAPER": 0.1,
+    "CACHE_FILE": "templates_cache.npz",
+    "MAX_SHIFT_SEC": 0.25,
+    "LAG_STEP": 8,
+    "MAX_VAL_ROWS": null,
+    "MAX_TEST_ROWS": null,
+    "MODE": "target_far",
+    "TARGET_FAR": 1e-06,
+    "OUT_DIR_ROOT": "reports/mf_baseline",
+    "N_JOBS": 15,
+    "BATCH_SZ": 256,
+    "HEARTBEAT_EVERY_N": 3000,
+    "HEARTBEAT_EVERY_SEC": 10.0,
+    "TQDM_MIN_INTERVAL": 0.5
+  },
+  "templates_cached": 256,
+  "val": {
+    "auc": 0.9565215082597452,
+    "ap": 0.0014642630654616699
+  },
+  "test": {
+    "auc": 0.9130850402816797,
+    "ap": 0.0014645495452938278,
+    "confusion_at_thr": {
+      "tn": 188299,
+      "fp": 0,
+      "fn": 48,
+      "tp": 0
+    }
+  },
+  "threshold": 0.20752724750316118,
+  "threshold_info": {
+    "mode": "target_far",
+    "far": 1e-06
+  },
+  "out_dir": "reports/mf_baseline/20251013-140838"
+}
