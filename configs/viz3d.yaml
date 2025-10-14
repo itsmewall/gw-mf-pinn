@@ -1,0 +1,14 @@
+viz3d:
+  enabled: true
+  backend: "pyvista"
+  mode: "save"
+  outfile: "results/viz3d/wave3d.png"
+  tube_radius: 0.01
+  color: [0.5, 0.8, 1.0]
+  figsize: [800, 600]
+  thinning: 1
+  camera:
+    azimuth: 45
+    elevation: 70
+    distance: null
+  annotate: true
