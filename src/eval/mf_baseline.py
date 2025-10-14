@@ -78,9 +78,9 @@ class CFG:
 
     # GPU
     USE_GPU: bool = True
-    GPU_INIT_BATCH_WIN: int = 4096         # palpite inicial de janelas por lote
+    GPU_INIT_BATCH_WIN: int = 8192
     GPU_MIN_BATCH_WIN: int  = 256
-    GPU_INIT_TEMPL_CHUNK: int = 64         # templates por chunk (ajusta em OOM)
+    GPU_INIT_TEMPL_CHUNK: int = 92         # templates por chunk (ajusta em OOM)
     GPU_MIN_TEMPL_CHUNK: int  = 8
     USE_FP16_TIME: bool = False            # manter tempo em fp32 para estabilidade
 
@@ -97,7 +97,7 @@ class CFG:
 
     # lags
     MAX_SHIFT_SEC: float = 0.25
-    LAG_STEP: int = 8
+    LAG_STEP: int = 12
 
     # limites
     MAX_VAL_ROWS: Optional[int] = None
