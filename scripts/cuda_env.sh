@@ -1,38 +1,22 @@
-# scripts/cuda_env.sh
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Este script pressupõe que o venv já está ativo (VIRTUAL_ENV definido).
-: "${VIRTUAL_ENV:?Ative o venv antes de chamar cuda_env.sh}"
+add_path(){ local p="$1"; [[ -d "$p" ]] && [[ ":${LD_LIBRARY_PATH-}:" != *":$p:"* ]] && export LD_LIBRARY_PATH="$p${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; }
 
-# Descobre o site-packages do venv atual
-SITEPKG="$(
-  python - <<'PY'
-import site, sys
-paths=[p for p in site.getsitepackages() if 'site-packages' in p]
-print(paths[0] if paths else site.getusersitepackages())
-PY
-)"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH-}"
 
-# Pastas das libs CUDA empacotadas via pip (nvidia-*)
-CUFFT_DIR="$SITEPKG/nvidia/cufft/lib"
-CURAND_DIR="$SITEPKG/nvidia/curand/lib"
-CRT_DIR="$SITEPKG/nvidia/cuda_runtime/lib"
+# WSL e libs do Ubuntu
+add_path "/usr/lib/wsl/lib"
+add_path "/usr/lib/x86_64-linux-gnu"
+add_path "/usr/local/lib"
 
-# Garante que LD_LIBRARY_PATH exista
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+# Paths do CUDA Toolkit instalado (ajuste a série se for 12-8 ou 12-6)
+add_path "/usr/local/cuda-12.9/targets/x86_64-linux/lib"
+add_path "/usr/local/cuda-12.9/lib64"
 
-# Só adiciona se existir
-add_path() {
-  local p="$1"
-  if [[ -d "$p" ]] && [[ ":$LD_LIBRARY_PATH:" != *":$p:"* ]]; then
-    LD_LIBRARY_PATH="$p${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  fi
-}
+# Também um fallback genérico, se existir
+add_path "/usr/local/cuda/targets/x86_64-linux/lib"
+add_path "/usr/local/cuda/lib64"
 
-add_path "$CUFFT_DIR"
-add_path "$CURAND_DIR"
-add_path "$CRT_DIR"
-
-export LD_LIBRARY_PATH
-echo "[cuda_env] LD_LIBRARY_PATH configurado."
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0}"
+echo "[cuda_env] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"

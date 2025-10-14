@@ -1,30 +1,27 @@
-# scripts/run_pipeline.sh
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
-# Raiz do projeto = pasta pai de scripts/
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Raiz do projeto é a pasta do script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Venv
-VENV="$ROOT/venv"
-if [[ ! -f "$VENV/bin/activate" ]]; then
-  echo "[run] venv não encontrado em $VENV"
-  echo "[run] crie com: python3 -m venv \"$VENV\" && source \"$VENV/bin/activate\" && pip install -U pip && pip install -r requirements.txt"
-  exit 1
+cd "$ROOT_DIR"
+
+# 1) Ativa venv
+if [ ! -d "venv" ]; then
+  echo "[RUN] Criando venv..."
+  python3 -m venv venv
 fi
+source "venv/bin/activate"
 
-# Ativa venv
-source "$VENV/bin/activate"
+python --version
 
-# CUDA env (usa libs do venv: libcufft/libcurand/cuda_runtime)
-source "$ROOT/scripts/cuda_env.sh"
+# 2) Exporta libs de CUDA no WSL sem quebrar o sistema
+bash "scripts/cuda_env.sh"
 
-# Sanity: GPU e Python
-python -V
+# 3) Garante CuPy funcional. Não mata se falhar, o MF tem fallback
+bash "scripts/bootstrap_gpu.sh" "venv" || true
+
+# 4) Roda o pipeline
 echo "[RUN] Iniciando pipeline…"
-
-# PYTHONPATH para importar src/* corretamente
-export PYTHONPATH="$ROOT"
-
-# Roda pipeline completo
-python "$ROOT/run.py"
+python run.py

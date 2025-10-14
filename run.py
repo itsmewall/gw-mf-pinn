@@ -34,9 +34,9 @@ from eval import mf_baseline as mbf
 # ============================================================
 ENABLE_DOWNLOAD      = False   # baixa GWOSC (quota controlada)
 ENABLE_WHITEN        = False   # pré-processa (bandpass/PSD/whiten) só novos
-ENABLE_WINDOWS       = True    # gera janelas/SNR só novos
-ENABLE_DATASET       = True    # recria dataset.parquet
-ENABLE_BASELINE_ML   = True    # roda baseline_ml.py
+ENABLE_WINDOWS       = False    # gera janelas/SNR só novos
+ENABLE_DATASET       = False    # recria dataset.parquet
+ENABLE_BASELINE_ML   = False    # roda baseline_ml.py
 ENABLE_MF_BASELINE   = True    # roda mf_baseline.py
 
 # PERFIL de download (se ENABLE_DOWNLOAD=True)
