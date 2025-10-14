@@ -2,13 +2,14 @@
 # --------------------------------------------------------------------------------------
 # Matched-filter baseline via NCC com FFT:
 # - GPU via CuPy com fallback automatico para CPU
-# - Sem alocacoes gigantes: multiplica X_fft (B,F) por 1 template de cada vez
-# - Autotuning de batch (janelas) e chunk de templates com backoff em OOM
+# - Streaming seguro de memoria: multiplica X_fft (B,F) por 1 template por vez
+# - Autotuning de batch de janelas e chunk de templates com backoff em OOM
 # - Index de windows por file_id (1x por run) e caches
-# - Restricoes de lag (±MAX_SHIFT_SEC) + passo LAG_STEP
+# - Restricoes de lag (±MAX_SHIFT_SEC) e passo LAG_STEP
 # - Banco de templates IMRPhenomD com cache .npz
-# - Depuracao forte: contadores e CSV de falhas em _debug/
-# - Self-test INJECT
+# - Veto de glitch opcional e configuravel
+# - Self-test INJECT e varredura de injecoes opcional
+# - Relatorios ROC, PR, histogramas e CSVs de scores
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from fractions import Fraction
 from functools import lru_cache
 from typing import Dict, Tuple, Optional, List
 from collections import Counter
+import warnings
 
 import h5py
 import numpy as np
@@ -80,15 +82,15 @@ class CFG:
     USE_GPU: bool = True
     GPU_INIT_BATCH_WIN: int = 8192
     GPU_MIN_BATCH_WIN: int  = 256
-    GPU_INIT_TEMPL_CHUNK: int = 92         # templates por chunk (ajusta em OOM)
+    GPU_INIT_TEMPL_CHUNK: int = 64
     GPU_MIN_TEMPL_CHUNK: int  = 8
-    USE_FP16_TIME: bool = False            # manter tempo em fp32 para estabilidade
+    USE_FP16_TIME: bool = False  # manter tempo em fp32 para estabilidade
 
     # banco de templates
-    TEMPLATES_N: int = 256
+    TEMPLATES_N: int = 1024
     TEMPLATE_SUBSAMPLE: int = 1
-    M1_RANGE: Tuple[float, float] = (5.0, 40.0)
-    M2_RANGE: Tuple[float, float] = (5.0, 40.0)
+    M1_RANGE: Tuple[float, float] = (3.0, 80.0)
+    M2_RANGE: Tuple[float, float] = (3.0, 80.0)
     SPIN1: float = 0.0
     SPIN2: float = 0.0
     F_LO: float = 20.0
@@ -96,16 +98,26 @@ class CFG:
     CACHE_FILE: str = "templates_cache.npz"
 
     # lags
-    MAX_SHIFT_SEC: float = 0.25
-    LAG_STEP: int = 12
+    MAX_SHIFT_SEC: float = 0.50
+    LAG_STEP: int = 4
+
+    # veto de glitch
+    ENABLE_GLITCH_VETO: bool = False
+    GLITCH_VETO_PEAK: float = 20.0
+    GLITCH_VETO_KURT: float = 80.0
 
     # limites
     MAX_VAL_ROWS: Optional[int] = None
     MAX_TEST_ROWS: Optional[int] = None
 
     # threshold
-    MODE: str = "target_far"
+    MODE: str = "target_far"  # "target_far" ou "best_f1"
     TARGET_FAR: float = 1e-6
+
+    # injecoes sinteticas opcionais
+    DO_INJECT_SWEEP: bool = False
+    INJECT_N: int = 50
+    INJECT_AMP: float = 0.5
 
     # saida
     OUT_DIR_ROOT: str = "reports/mf_baseline"
@@ -165,6 +177,7 @@ def cached_start_arrays(win_path: str):
     return sgps, sidx, meta_in
 
 def resolve_whitened_path(win_path: str, meta_in: Dict[str, str]) -> Optional[str]:
+    # tenta metadados
     src = meta_in.get("source_path") or meta_in.get("source_file") or meta_in.get("source")
     candidates = []
     if src and os.path.isabs(src):
@@ -175,6 +188,7 @@ def resolve_whitened_path(win_path: str, meta_in: Dict[str, str]) -> Optional[st
             os.path.join("data", "interim", os.path.basename(src)),
             os.path.join("data", "processed", os.path.basename(src)),
         ]
+    # convencao *_whitened.hdf5 ao lado e nos dirs padrão
     bn = os.path.basename(win_path).replace("_windows.hdf5", "_whitened.hdf5")
     candidates += [
         os.path.join(os.path.dirname(win_path), bn),
@@ -184,6 +198,17 @@ def resolve_whitened_path(win_path: str, meta_in: Dict[str, str]) -> Optional[st
     for p in candidates:
         if p and os.path.exists(p):
             return os.path.abspath(p)
+    # fallback final: tenta mesmo basename da fonte gravada em meta como nome simples
+    if src:
+        base = os.path.basename(str(src))
+        guesses = [
+            os.path.join(os.path.dirname(win_path), base),
+            os.path.join("data", "interim", base),
+            os.path.join("data", "processed", base),
+        ]
+        for g in guesses:
+            if os.path.exists(g):
+                return os.path.abspath(g)
     return None
 
 # =========================
@@ -319,8 +344,25 @@ def load_window_slice(win_path: str, whitened_path: str, start_gps: float) -> Op
                                   "reason": "non_finite"})
             return None
 
+        # normalizacao
         x -= x.mean()
         x /= (x.std() + 1e-12)
+
+        # veto opcional
+        if CFG.ENABLE_GLITCH_VETO:
+            peak = float(np.max(np.abs(x)))
+            kurt = float(np.mean(((x - x.mean())/(x.std()+1e-12))**4))
+            if peak > CFG.GLITCH_VETO_PEAK:
+                FAIL_COUNTER["glitch_veto_peak"] += 1
+                FAIL_ROWS.append({"file_id": os.path.basename(win_path),
+                                  "reason": "glitch_veto_peak", "peak": peak})
+                return None
+            if kurt > CFG.GLITCH_VETO_KURT:
+                FAIL_COUNTER["glitch_veto_kurt"] += 1
+                FAIL_ROWS.append({"file_id": os.path.basename(win_path),
+                                  "reason": "glitch_veto_kurt", "kurt": kurt})
+                return None
+
         return x
     except Exception as e:
         if DEBUG_STRICT:
@@ -343,23 +385,16 @@ def _ncc_fft_max_cpu(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step
     return float(np.nanmax(c[lo:hi:lag_step]))
 
 # =========================
-# GPU batelado sem tensor gigantes
+# GPU streaming sem tensores gigantes
 # =========================
 def _gpu_autotune(B_init: int, Kc_init: int, nfft: int, n_full: int, F: int) -> Tuple[int, int]:
-    """
-    Ajusta B (batch janelas) e Kc (chunk de templates) para caber na GPU.
-    Estima consumo e faz backoff em caso de OOM.
-    """
     B, Kc = B_init, Kc_init
     if not _HAS_CUPY: return B, Kc
 
-    def enough(Bt: int, Kt: int) -> bool:
+    def enough(Bt: int) -> bool:
         try:
-            # buffers principais: X_dev(B,L) ~ float32, X_fft(B,F) complex64,
-            # c_tmp(B,n_full) float32, e espectro 1 template complex64 (F)
-            # alocacao tentativa pequena para validar
-            L = n_full // 2 + 1  # aproximacao
-            x = cp.empty((Bt, F*2), dtype=cp.float32)  # aprox
+            # buffers principais aproximados
+            x = cp.empty((Bt, F*2), dtype=cp.float32)
             xf= cp.empty((Bt, F), dtype=cp.complex64)
             ct= cp.empty((Bt, n_full), dtype=cp.float32)
             ht= cp.empty((F,), dtype=cp.complex64)
@@ -370,11 +405,10 @@ def _gpu_autotune(B_init: int, Kc_init: int, nfft: int, n_full: int, F: int) -> 
             cp.get_default_memory_pool().free_all_blocks()
             return False
 
-    while B >= CFG.GPU_MIN_BATCH_WIN and not enough(B, Kc):
+    while B >= CFG.GPU_MIN_BATCH_WIN and not enough(B):
         B //= 2
     if B < CFG.GPU_MIN_BATCH_WIN:
         B = CFG.GPU_MIN_BATCH_WIN
-    # Kc entra só como loop externo; deixamos pelo menos 8
     if Kc < CFG.GPU_MIN_TEMPL_CHUNK:
         Kc = CFG.GPU_MIN_TEMPL_CHUNK
     return B, Kc
@@ -384,7 +418,6 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
     n = len(df_sub)
     scores = np.zeros(n, np.float32)
 
-    # templates host
     keys = list(tmpl_cache.keys())
     if CFG.TEMPLATE_SUBSAMPLE > 1:
         keys = keys[::CFG.TEMPLATE_SUBSAMPLE]
@@ -403,7 +436,6 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
     lo = max(0, center - max_shift)
     hi = min(n_full, center + max_shift + 1)
 
-    # autotune batch
     B0, Kc0 = _gpu_autotune(CFG.GPU_INIT_BATCH_WIN, CFG.GPU_INIT_TEMPL_CHUNK, nfft, n_full, F)
     B_cur, Kc_cur = B0, Kc0
 
@@ -432,9 +464,7 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 x = load_window_slice(win_path, wht, sgps)
                 if x is None or not np.any(np.isfinite(x)):
                     X_host.append(None); continue
-                x = x.astype(np.float32, copy=False)
-                x -= x.mean(); x /= (x.std() + 1e-12)
-                X_host.append(x)
+                X_host.append(x.astype(np.float32, copy=False))
 
             mask_valid = np.array([x is not None for x in X_host], dtype=bool)
             if not mask_valid.any():
@@ -446,34 +476,28 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 Xv = np.stack([x for x in X_host if x is not None], axis=0)  # (Bv, L)
                 dtype_time = cp.float16 if CFG.USE_FP16_TIME else cp.float32
                 X_dev = cp.asarray(Xv, dtype=dtype_time)
-                X_fft = cp.fft.rfft(X_dev.astype(cp.float32, copy=False), nfft, axis=1)  # (Bv,F) complex64
+                X_fft = cp.fft.rfft(X_dev.astype(cp.float32, copy=False), nfft, axis=1)  # (Bv,F)
                 X_norm = cp.linalg.norm(X_dev.astype(cp.float32, copy=False), axis=1).astype(cp.float32, copy=False)
                 best = cp.full((X_dev.shape[0],), -cp.inf, dtype=cp.float32)
 
-                # percorre templates em chunks pequenos para manter cache quente e baixar overhead de CPU->GPU
                 for t0_idx in range(0, K, Kc_cur):
                     t1_idx = min(t0_idx + Kc_cur, K)
-                    # precompute espectros dos templates desse chunk no host e sobe 1 a 1
                     for k in range(t0_idx, t1_idx):
                         h = templates_host[k]
                         h_dev = cp.asarray(h[::-1], dtype=cp.float32)
-                        H_fft = cp.fft.rfft(h_dev, nfft)  # (F,) complex64
-                        # produto por broadcasting: (Bv,F) * (F,) -> (Bv,F)
-                        C_fft = X_fft * cp.conj(H_fft)
-                        c = cp.fft.irfft(C_fft, nfft, axis=1)[:, :n_full]  # (Bv,n_full) float32
-                        denom = (X_norm) * cp.linalg.norm(h_dev) + 1e-12   # (Bv,)
+                        H_fft = cp.fft.rfft(h_dev, nfft)  # (F,)
+                        C_fft = X_fft * cp.conj(H_fft)    # (Bv,F)
+                        c = cp.fft.irfft(C_fft, nfft, axis=1)[:, :n_full]  # (Bv,n_full)
+                        denom = (X_norm) * cp.linalg.norm(h_dev) + 1e-12
                         c = c / denom[:, None]
-                        # pega max nos lags de interesse
-                        m = cp.max(c[:, lo:hi:lag_step], axis=1)            # (Bv,)
+                        m = cp.max(c[:, lo:hi:lag_step], axis=1)
                         best = cp.maximum(best, m)
 
-                        # libera
                         del h_dev, H_fft, C_fft, c, m
                         cp.get_default_memory_pool().free_all_blocks()
 
                 best_host = best.get()
 
-                # escreve de volta nas posicoes do dataframe
                 pos_valid = np.where(mask_valid)[0]
                 for j, val in zip(pos_valid, best_host):
                     out_pos = df_sub.index.get_loc(b_idx[j])
@@ -485,7 +509,6 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 b0 += B_cur
 
             except cp.cuda.memory.OutOfMemoryError:
-                # backoff agressivo
                 cp.get_default_memory_pool().free_all_blocks()
                 if B_cur > CFG.GPU_MIN_BATCH_WIN:
                     B_cur = max(CFG.GPU_MIN_BATCH_WIN, B_cur // 2)
@@ -496,7 +519,7 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                     _log(f"[{name}] OOM: reduzindo templ_chunk para {Kc_cur}")
                     continue
                 else:
-                    raise  # sem como reduzir mais
+                    raise
 
     _log(f"      [{name}] tempo={time.time()-t0:.1f}s")
     return scores
@@ -632,7 +655,8 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
         plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title(f"ROC - {prefix}")
         plt.legend(); plt.grid(alpha=.2); plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"roc_{prefix}.png"), dpi=140); plt.close()
-    except Exception: pass
+    except Exception:
+        pass
 
     try:
         prec, rec, _ = precision_recall_curve(y_true, scores)
@@ -641,7 +665,8 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
         plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(f"PR - {prefix}")
         plt.legend(); plt.grid(alpha=.2); plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"pr_{prefix}.png"), dpi=140); plt.close()
-    except Exception: pass
+    except Exception:
+        pass
 
     try:
         plt.figure(figsize=(6.2,3.6))
@@ -649,7 +674,8 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
         plt.hist(scores[y_true==1], bins=60, alpha=.7, label="pos", density=True)
         plt.legend(); plt.grid(alpha=.2); plt.title(f"Score dist - {prefix}")
         plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"hist_{prefix}.png"), dpi=140); plt.close()
-    except Exception: pass
+    except Exception:
+        pass
 
     return auc, ap
 
@@ -662,9 +688,50 @@ def confusion_at_threshold(y_true: np.ndarray, scores: np.ndarray, thr: float):
     return tn, fp, fn, tp
 
 # =========================
+# INJECT sweep opcional
+# =========================
+def inject_sweep_quick(idx_map: Dict[str,str], tmpl_cache: Dict[str,np.ndarray]) -> None:
+    try:
+        import random
+        any_fid = next(iter(idx_map.keys()))
+        any_win = idx_map[any_fid]
+        sgps, _, meta_in = cached_start_arrays(any_win)
+        if len(sgps) < 100:
+            print("[INJECT] sgps insuficiente, pulando.")
+            return
+        wht = resolve_whitened_path(any_win, meta_in)
+        if not wht or not os.path.exists(wht):
+            print("[INJECT] whitened ausente, pulando.")
+            return
+
+        ks = list(tmpl_cache.keys())
+        random.shuffle(ks)
+        ks = ks[:min(CFG.INJECT_N, len(ks))]
+        vals = []
+        hits = 0
+        thr_probe = 0.1
+        for k in ks:
+            h = tmpl_cache[k]
+            g = float(np.random.choice(sgps[20:-20]))
+            xr = load_window_slice(any_win, wht, g)
+            if xr is None:
+                continue
+            inj = ((xr + CFG.INJECT_AMP*h[:len(xr)]) - np.mean(xr)) / (np.std(xr)+1e-12)
+            s = _ncc_fft_max_cpu(inj, h, int(CFG.MAX_SHIFT_SEC*CFG.FS_TARGET), max(1, CFG.LAG_STEP))
+            vals.append(s)
+            hits += int(s > thr_probe)
+        if vals:
+            print(f"[INJECT] n={len(vals)} med={np.median(vals):.3f} max={np.max(vals):.3f} recall@{thr_probe}={hits/len(vals):.2f}")
+        else:
+            print("[INJECT] sem medidas validas.")
+    except Exception as e:
+        print(f"[INJECT] falhou: {e}")
+
+# =========================
 # MAIN
 # =========================
 def main():
+    warnings.filterwarnings("ignore", category=UserWarning)
     t_all = time.time()
     out_dir = os.path.join(CFG.OUT_DIR_ROOT, ts_tag()); ensure_dir(out_dir)
 
@@ -734,6 +801,9 @@ def main():
             print("[DEBUG] Self-test INJECT pulado: sgps insuficiente.")
     except Exception as e:
         print(f"[DEBUG] Self-test INJECT falhou: {e}")
+
+    if CFG.DO_INJECT_SWEEP:
+        inject_sweep_quick(idx_map, tmpl_cache)
 
     # 3) VAL
     _log("[3/6] Scoring VAL ...")

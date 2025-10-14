@@ -1,4 +1,5 @@
-# GW-MF-PINN
+# A Multi-Fidelity Physics-Informed Architecture for Gravitational-Wave Detection and Parameter Estimation
+## GW-MF-PINN
 
 **Version**: 1.0.2
 
