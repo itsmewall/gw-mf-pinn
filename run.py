@@ -1,6 +1,6 @@
 # run.py
 # --------------------------------------------------------------------------------------
-# Motor global SEM ARGUMENTOS: GWOSC → preprocess → windows → dataset → baselines (ML/MF)
+# Motor global SEM ARGUMENTOS: GWOSC -> preprocess -> windows -> dataset -> baselines (ML/MF)
 # Configure pelos TOGGLES abaixo. Logs em logs/pipeline.log
 # Requisitos: requests, h5py, numpy, scipy, tqdm, pyyaml, gwosc, pandas, scikit-learn, joblib, pycbc
 # --------------------------------------------------------------------------------------
@@ -14,7 +14,7 @@ import requests
 from tqdm import tqdm
 
 # ============================================================
-# IMPORTA MÓDULOS DO PROJETO (ajusta sys.path)
+# IMPORTA MODULOS DO PROJETO (ajusta sys.path)
 # ============================================================
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC  = os.path.join(ROOT, "src")
@@ -24,19 +24,23 @@ if SRC not in sys.path:
 from gwdata import preprocess as pp
 from gwdata.windows import process_whitened_file
 
-# Os módulos de eval expõem main(); chamaremos direto:
+# Modulos de eval expõem main(); chamaremos direto:
 from eval import dataset_builder as dsb
 from eval import baseline_ml as bml
 from eval import mf_baseline as mbf
 
+# Viz
+from viz import plot_scores_timeline as viz_timeline
+from viz import ligo_overlay as viz_overlay
+
 # ============================================================
-# TOGGLES — ligue/desligue estágios
+# TOGGLES - ligue/desligue estágios
 # ============================================================
 ENABLE_DOWNLOAD      = False   # baixa GWOSC (quota controlada)
 ENABLE_WHITEN        = False   # pré-processa (bandpass/PSD/whiten) só novos
-ENABLE_WINDOWS       = False    # gera janelas/SNR só novos
-ENABLE_DATASET       = False    # recria dataset.parquet
-ENABLE_BASELINE_ML   = False    # roda baseline_ml.py
+ENABLE_WINDOWS       = False   # gera janelas/SNR só novos
+ENABLE_DATASET       = False   # recria dataset.parquet
+ENABLE_BASELINE_ML   = False   # roda baseline_ml.py
 ENABLE_MF_BASELINE   = True    # roda mf_baseline.py
 
 # PERFIL de download (se ENABLE_DOWNLOAD=True)
@@ -75,7 +79,7 @@ else:
 STOP_SENTINEL = "STOP"         # criar um arquivo STOP na raiz interrompe downloads
 
 # ============================================================
-# PRÉ-PROCESSAMENTO
+# PRE-PROCESSAMENTO
 # ============================================================
 LOWCUT       = 35.0
 HIGHCUT      = 350.0
@@ -251,7 +255,7 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
     downloaded = 0
     for item in items:
         if os.path.exists(os.path.join(ROOT, STOP_SENTINEL)):
-            logger.warning("[GWOSC] STOP detectado — interrompendo downloads com segurança.")
+            logger.warning("[GWOSC] STOP detectado - interrompendo downloads com segurança.")
             break
         if downloaded >= MAX_FILES_PER_EVENT:
             logger.info(f"[GWOSC] {event}: limite {MAX_FILES_PER_EVENT} atingido.")
@@ -266,7 +270,7 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
         url, fname = choice
         fpath = os.path.join(out_dir, fname)
         if os.path.exists(fpath):
-            logger.info(f"[GWOSC] {event}: já existe → {fname} (pulando)")
+            logger.info(f"[GWOSC] {event}: já existe -> {fname} (pulando)")
             continue
 
         # HEAD p/ tamanho
@@ -283,7 +287,7 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
 
         need = size if size else 256 * 1024**2
         if (budget_state["bytes"] + need) > MAX_DOWNLOAD_BYTES_PER_RUN:
-            logger.info("[GWOSC] Ultrapassaria cota — parando.")
+            logger.info("[GWOSC] Ultrapassaria cota - parando.")
             break
         if not _enough_space(out_dir, need):
             logger.error("[GWOSC] Espaço em disco insuficiente.")
@@ -305,7 +309,7 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
     return downloaded
 
 # ============================================================
-# ESTÁGIOS
+# ESTAGIOS
 # ============================================================
 def stage_download(logger) -> Dict[str, int]:
     if not ENABLE_DOWNLOAD:
@@ -472,6 +476,19 @@ def main():
         logger.info(f"[MF] Concluído em {t():.1f}s")
         _summarize_latest_mf(logger)
 
+        # Viz: Timeline (scores vs tempo)
+        try:
+            logger.info("[VIZ] Gerando timeline de scores (MF/ML) …")
+            viz_timeline.main()
+        except Exception as e:
+            logger.error(f"[VIZ] timeline falhou: {e}")
+
+        # Viz: Overlay estilo LIGO (H1/L1)
+        try:
+            logger.info("[VIZ] Gerando overlay H1/L1 (estilo LIGO) …")
+            viz_overlay.main()
+        except Exception as e:
+            logger.error(f"[VIZ] overlay falhou: {e}")
 
     # RESUMO
     raw_count       = len(_list_files(os.path.join(DATA_RAW, "*.hdf5")))
