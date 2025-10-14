@@ -1,20 +1,26 @@
 # src/eval/mf_baseline.py
 # --------------------------------------------------------------------------------------
-# Matched-filter baseline via NCC com FFT:
-# - GPU via CuPy com fallback automatico para CPU
-# - Streaming de memoria: multiplica X_fft (B,F) por 1 template por vez
-# - Autotuning de batch e chunk com backoff em OOM
-# - Index de windows por file_id e caches
-# - Restricao de lag (±MAX_SHIFT_SEC) e passo LAG_STEP
-# - Banco de templates IMRPhenomD com cache .npz
-# - Self-test INJECT robusto
-# - Pooling top-k entre templates para reduzir mismatch
-# - Calibracao de limiar por ROC com restricao de FPR (FAR proxy)
-# - Relatorios ROC, PR, histogramas e CSVs de scores
+# Matched-filter baseline via NCC
+# Recursos:
+#   - GPU via CuPy com fallback para CPU
+#   - CPU: dois modos
+#       1) Nativo C++ OpenMP/pybind (accel.ncc_fft) para lags curtos
+#       2) FFT NumPy como legado
+#   - Autotuning de batch e chunk no GPU com backoff em OOM
+#   - Index de windows por file_id e caches
+#   - Restricao de lag (±MAX_SHIFT_SEC) e passo LAG_STEP
+#   - Banco de templates IMRPhenomD com cache .npz
+#   - Self-test de injeção rápida
+#   - Pooling top-k entre templates
+#   - Três modos de threshold: constrained_roc, target_far, best_f1
+#   - Relatórios ROC, PR, histogramas, CSV de scores e thresholds.json
+#   - N1: Varredura sistemática de parâmetros do banco de templates no split VAL
+#        com tabela de experimentos e escolha automática do melhor setup
+#   - Patches: amostragem estratificada para a sweep e calibração por FAR
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
-import os, json, time, math, warnings
+import os, sys, json, time, math, warnings, pathlib
 from glob import glob
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -22,6 +28,8 @@ from fractions import Fraction
 from functools import lru_cache
 from typing import Dict, Tuple, Optional, List
 from collections import Counter
+from contextlib import contextmanager
+import itertools
 
 import h5py
 import numpy as np
@@ -58,6 +66,20 @@ except Exception as e:
     _HAS_CUPY = False
 
 # =========================
+# Nativo C++ via accel.ncc_fft
+# =========================
+_HAS_NATIVE = False
+_NATIVE_ERR = None
+try:
+    sys.path.insert(0, str(pathlib.Path("src").resolve()))
+    from accel import ncc_fft as ncc_native
+    if hasattr(ncc_native, "correlate_all_lags"):
+        _HAS_NATIVE = True
+except Exception as e:
+    _NATIVE_ERR = f"{type(e).__name__}: {e}"
+    _HAS_NATIVE = False
+
+# =========================
 # Depuracao global
 # =========================
 DEBUG_STRICT = True
@@ -82,13 +104,17 @@ class CFG:
     USE_GPU: bool = True
     GPU_INIT_BATCH_WIN: int = 8192
     GPU_MIN_BATCH_WIN: int  = 256
-    GPU_INIT_TEMPL_CHUNK: int = 64
-    GPU_MIN_TEMPL_CHUNK: int  = 8
+    GPU_INIT_TEMPL_CHUNK: int = 128
+    GPU_MIN_TEMPL_CHUNK: int = 8
     USE_FP16_TIME: bool = False
+
+    # CPU nativo
+    USE_NATIVE_NCC: bool = True
+    NATIVE_MAXSHIFT_HEURISTIC: int = 128  # usa nativo quando max_shift_amostras <= isso
 
     # banco de templates
     TEMPLATES_N: int = 1024
-    TEMPLATE_SUBSAMPLE: int = 1
+    TEMPLATE_SUBSAMPLE: int = 2
     M1_RANGE: Tuple[float, float] = (3.0, 80.0)
     M2_RANGE: Tuple[float, float] = (3.0, 80.0)
     SPIN1: float = 0.0
@@ -98,8 +124,8 @@ class CFG:
     CACHE_FILE: str = "templates_cache.npz"
 
     # lags
-    MAX_SHIFT_SEC: float = 0.50
-    LAG_STEP: int = 4
+    MAX_SHIFT_SEC: float = 0.02
+    LAG_STEP: int = 2
 
     # veto de glitch
     ENABLE_GLITCH_VETO: bool = False
@@ -111,18 +137,18 @@ class CFG:
     MAX_TEST_ROWS: Optional[int] = None
 
     # calibracao de threshold
-    MODE: str = "constrained_roc"  # options: "constrained_roc", "target_far", "best_f1"
-    TARGET_FAR: float = 1e-6        # usado como proxy de FPR
-    MIN_RECALL_AT_FPR: float = 0.01 # alvo minimo de recall quando possivel
+    MODE: str = "target_far"       # "constrained_roc" | "target_far" | "best_f1"
+    TARGET_FAR: float = 1e-4
+    MIN_RECALL_AT_FPR: float = 0.01
 
     # pooling entre templates
-    TOPK_POOL: int = 3  # agrega top-k em vez de puro max. k=1 reproduz max
+    TOPK_POOL: int = 1
 
     # injecoes sinteticas
     DO_INJECT_SWEEP: bool = True
     INJECT_N: int = 64
-    INJECT_AMP: float = 0.6     # amplitude levemente maior para validar sensibilidade
-    INJECT_EXPECT_MIN: float = 0.15  # pico esperado minimo no self-test
+    INJECT_AMP: float = 0.6
+    INJECT_EXPECT_MIN: float = 0.15
 
     # saida
     OUT_DIR_ROOT: str = "reports/mf_baseline"
@@ -135,6 +161,25 @@ class CFG:
     HEARTBEAT_EVERY_N: int = 10000
     HEARTBEAT_EVERY_SEC: float = 100.0
     TQDM_MIN_INTERVAL: float = 0.5
+
+    # =========================
+    # N1: Varredura sistemática
+    # =========================
+    SWEEP_ENABLED: bool = True            # habilita a varredura antes do run final
+    SWEEP_MAX_VAL_ROWS: int = 30000       # teto de linhas para a sweep
+    SWEEP_NEG_PER_POS: int = 800          # negativos por positivo no subset da sweep
+    SWEEP_RANDOM_SEED: int = 42           # reprodutibilidade
+    SWEEP_METRIC: str = "recall_at_far"   # "recall_at_far" ou "auc"
+    SWEEP_FAR: float = 1e-3               # FAR alvo para medir recall
+    SWEEP_GRID_TEMPLATES_N: Tuple[int, ...] = (256, 512, 1024)
+    SWEEP_GRID_TEMPLATE_SUBSAMPLE: Tuple[int, ...] = (1, 2, 4)
+    SWEEP_GRID_TOPK: Tuple[int, ...] = (1, 3)
+    SWEEP_GRID_M1: Tuple[Tuple[float,float], ...] = (
+        (5.0, 40.0), (10.0, 50.0), (20.0, 80.0)
+    )
+    SWEEP_GRID_M2: Tuple[Tuple[float,float], ...] = (
+        (5.0, 40.0), (10.0, 50.0), (20.0, 80.0)
+    )
 
 CFG = CFG()
 
@@ -162,6 +207,22 @@ def read_attrs(obj) -> Dict[str, float | str]:
     except Exception:
         pass
     return out
+
+@contextmanager
+def patch_cfg(**over):
+    keep = {}
+    for k, v in over.items():
+        keep[k] = getattr(CFG, k)
+        setattr(CFG, k, v)
+    try:
+        yield
+    finally:
+        for k, v in keep.items():
+            setattr(CFG, k, v)
+
+def cache_name_for(m1rng, m2rng, n, subs):
+    m1a, m1b = m1rng; m2a, m2b = m2rng
+    return f"tmplcache_m1_{m1a:.0f}-{m1b:.0f}_m2_{m2a:.0f}-{m2b:.0f}_n{n}_sub{subs}.npz"
 
 # =========================
 # Index de windows e caches
@@ -256,8 +317,8 @@ def build_template_cache(bank, fs, window_sec) -> Dict[str, np.ndarray]:
         cache[key] = synth_template(m1, m2, s1, s2, fs, wlen, CFG.F_LO, CFG.HP_WINDOW_TAPER)
     return cache
 
-def maybe_load_template_cache(out_dir: str, bank) -> Dict[str, np.ndarray]:
-    cache_path = os.path.join(out_dir, CFG.CACHE_FILE)
+def maybe_load_template_cache(out_dir: str, bank, cache_name: Optional[str] = None) -> Dict[str, np.ndarray]:
+    cache_path = os.path.join(out_dir, cache_name or CFG.CACHE_FILE)
     if os.path.exists(cache_path):
         try:
             with np.load(cache_path, allow_pickle=True) as npz:
@@ -372,21 +433,30 @@ def load_window_slice(win_path: str, whitened_path: str, start_gps: float) -> Op
         return None
 
 # =========================
-# NCC via FFT CPU
+# NCC helpers CPU
 # =========================
-def _ncc_fft_series_cpu(x: np.ndarray, h: np.ndarray, nfft: int, n_full: int) -> np.ndarray:
-    # serie de correlacao normalizada em toda a faixa, depois amostramos o range de lags
+def _ncc_fft_series_cpu(x: np.ndarray, h: np.ndarray) -> np.ndarray:
     c = np_fftconvolve(x, h[::-1], mode="full")
     denom = (np.linalg.norm(x) * np.linalg.norm(h)) + 1e-12
     return (c / denom).astype(np.float32, copy=False)
 
 def _ncc_fft_max_cpu(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int) -> float:
-    c = _ncc_fft_series_cpu(x, h, nfft=0, n_full=0)  # nfft,n_full nao usados aqui
+    c = _ncc_fft_series_cpu(x, h)
     L = c.size
     center = L // 2
     lo = max(0, center - max_shift_samp)
     hi = min(L, center + max_shift_samp + 1)
     return float(np.nanmax(c[lo:hi:lag_step]))
+
+def _ncc_native_max_cpu(x: np.ndarray, h: np.ndarray, max_shift_samp: int, lag_step: int) -> float:
+    a = x.astype(np.float64, copy=False)
+    b = h.astype(np.float64, copy=False)
+    max_shift_samp = int(max(0, min(max_shift_samp, len(a) - 1)))
+    if max_shift_samp == 0:
+        r = ncc_native.correlate_all_lags(a, b, 0)
+        return float(r[0])
+    r = ncc_native.correlate_all_lags(a, b, int(max_shift_samp))  # shape 2*max_shift+1
+    return float(np.max(np.asarray(r)[::max(1, int(lag_step))]))
 
 # =========================
 # GPU streaming
@@ -420,6 +490,9 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                                tmpl_cache: Dict[str,np.ndarray]) -> np.ndarray:
     n = len(df_sub)
     scores = np.zeros(n, np.float32)
+    if n == 0:
+        _log(f"[{name}] janelas=0 | GPU streaming pulado")
+        return scores
 
     keys = list(tmpl_cache.keys())
     if CFG.TEMPLATE_SUBSAMPLE > 1:
@@ -479,7 +552,7 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 X_fft = cp.fft.rfft(X_dev.astype(cp.float32, copy=False), nfft, axis=1)  # (Bv,F)
                 X_norm = cp.linalg.norm(X_dev.astype(cp.float32, copy=False), axis=1).astype(cp.float32, copy=False)
 
-                # mantemos os k melhores por janela
+                # k melhores por janela
                 topk = CFG.TOPK_POOL if CFG.TOPK_POOL and CFG.TOPK_POOL > 1 else 1
                 if topk == 1:
                     agg = cp.full((X_dev.shape[0],), -cp.inf, dtype=cp.float32)
@@ -496,27 +569,22 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                         c = cp.fft.irfft(C_fft, nfft, axis=1)[:, :n_full]
                         denom = (X_norm) * cp.linalg.norm(h_dev) + 1e-12
                         c = c / denom[:, None]
-                        m = cp.max(c[:, lo:hi:lag_step], axis=1)  # (Bv,)
-
+                        m = cp.max(c[:, lo:hi:lag_step], axis=1)
                         if topk == 1:
                             agg = cp.maximum(agg, m)
                         else:
-                            # insere m no vetor top-k de cada janela
-                            # estratégia simples: substitui o menor quando maior
                             min_idx = cp.argmin(agg, axis=1)
-                            replace_mask = m > agg[cp.arange(agg.shape[0]), min_idx]
-                            agg[cp.arange(agg.shape[0]), min_idx] = cp.where(replace_mask, m, agg[cp.arange(agg.shape[0]), min_idx])
-
+                            rows = cp.arange(agg.shape[0])
+                            replace_mask = m > agg[rows, min_idx]
+                            agg[rows, min_idx] = cp.where(replace_mask, m, agg[rows, min_idx])
                         del h_dev, H_fft, C_fft, c, m
                         cp.get_default_memory_pool().free_all_blocks()
 
                 if topk == 1:
                     best_host = agg.get()
                 else:
-                    # média dos top-k por janela melhora robustez a mismatch
                     best_host = cp.mean(agg, axis=1).get()
 
-                # escreve de volta
                 pos_valid = np.where(mask_valid)[0]
                 for j, val in zip(pos_valid, best_host):
                     out_pos = df_sub.index.get_loc(b_idx[j])
@@ -545,10 +613,10 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
     return scores
 
 # =========================
-# CPU legado e roteador
+# CPU e roteador
 # =========================
-def _score_one_cpu(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int,
-                   lag_step: int, templates_host: List[np.ndarray], topk: int) -> float:
+def _score_one_cpu_fft(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int,
+                       lag_step: int, templates_host: List[np.ndarray], topk: int) -> float:
     win_path = idx_map.get(fid)
     if not win_path:
         if DEBUG_STRICT: FAIL_COUNTER["no_win_path"] += 1
@@ -568,7 +636,6 @@ def _score_one_cpu(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int
         if x is None or not np.any(np.isfinite(x)):
             if DEBUG_STRICT: FAIL_COUNTER["slice_none"] += 1
             return 0.0
-
         vals = []
         for h in templates_host:
             s = _ncc_fft_max_cpu(x, h, max_shift_samp=max_shift, lag_step=lag_step)
@@ -587,8 +654,53 @@ def _score_one_cpu(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int
                               "reason": "exception_score", "msg": repr(e)})
         return 0.0
 
+def _score_one_cpu_native(fid: str, sgps: float, idx_map: Dict[str,str], max_shift: int,
+                          lag_step: int, templates_host: List[np.ndarray], topk: int) -> float:
+    win_path = idx_map.get(fid)
+    if not win_path:
+        if DEBUG_STRICT: FAIL_COUNTER["no_win_path"] += 1
+        return 0.0
+    _, _, meta_in = cached_start_arrays(win_path)
+    wht = resolve_whitened_path(win_path, meta_in)
+    if not wht or not os.path.exists(wht):
+        if DEBUG_STRICT:
+            FAIL_COUNTER["wht_missing"] += 1
+            FAIL_ROWS.append({"file_id": os.path.basename(win_path),
+                              "reason": "wht_missing",
+                              "meta_in": dict(meta_in)})
+        return 0.0
+
+    try:
+        x = load_window_slice(win_path, wht, float(sgps))
+        if x is None or not np.any(np.isfinite(x)):
+            if DEBUG_STRICT: FAIL_COUNTER["slice_none"] += 1
+            return 0.0
+        vals = []
+        for h in templates_host:
+            s = _ncc_native_max_cpu(x, h, max_shift_samp=max_shift, lag_step=lag_step)
+            vals.append(s)
+        if not vals:
+            return 0.0
+        vals = np.array(vals, dtype=np.float32)
+        if topk <= 1:
+            return float(np.max(vals))
+        k = min(topk, vals.size)
+        return float(np.mean(np.partition(vals, -k)[-k:]))
+    except Exception as e:
+        if DEBUG_STRICT:
+            FAIL_COUNTER["exception_score_native"] += 1
+            FAIL_ROWS.append({"file_id": os.path.basename(win_path),
+                              "reason": "exception_score_native", "msg": repr(e)})
+        return 0.0
+
 def score_subset_cpu(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
                      tmpl_cache: Dict[str,np.ndarray]) -> np.ndarray:
+    n = len(df_sub)
+    scores = np.zeros(n, np.float32)
+    if n == 0:
+        _log(f"[{name}] janelas=0 | CPU pulado")
+        return scores
+
     keys = list(tmpl_cache.keys())
     if CFG.TEMPLATE_SUBSAMPLE > 1:
         keys = keys[::CFG.TEMPLATE_SUBSAMPLE]
@@ -599,19 +711,21 @@ def score_subset_cpu(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
     lag_step  = max(1, int(CFG.LAG_STEP))
     topk = max(1, int(CFG.TOPK_POOL))
 
-    n = len(df_sub)
-    scores = np.zeros(n, np.float32)
+    use_native = bool(_HAS_NATIVE and CFG.USE_NATIVE_NCC and max_shift <= CFG.NATIVE_MAXSHIFT_HEURISTIC)
+    mode_cpu = "native" if use_native else "fft"
 
-    _log(f"[{name}] janelas={n:,} | templates={len(templates_host)} | topk={topk} | max_shift={CFG.MAX_SHIFT_SEC:.3f}s | lag_step={lag_step} | jobs={CFG.N_JOBS} | GPU=False")
+    _log(f"[{name}] janelas={n:,} | templates={len(templates_host)} | topk={topk} | max_shift={CFG.MAX_SHIFT_SEC:.3f}s | lag_step={lag_step} | jobs={CFG.N_JOBS} | CPU mode={mode_cpu}")
 
     idx = df_sub.index.to_list()
     batches = [idx[i:i+CFG.BATCH_SZ] for i in range(0, n, CFG.BATCH_SZ)]
 
     t0 = time.time(); last_hb = t0; done = 0
+    fn_worker = _score_one_cpu_native if use_native else _score_one_cpu_fft
+
     with tqdm(total=n, unit="win", mininterval=CFG.TQDM_MIN_INTERVAL, desc=f"[{name}] NCC", leave=True) as bar:
         for b in batches:
             out_final = Parallel(n_jobs=CFG.N_JOBS, backend="loky")(
-                delayed(_score_one_cpu)(
+                delayed(fn_worker)(
                     df_sub.at[i, "file_id"],
                     float(df_sub.at[i, "start_gps"]),
                     idx_map, max_shift, lag_step,
@@ -641,46 +755,59 @@ def score_subset(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
 # =========================
 # Thresholds e metricas
 # =========================
+def _safe_thr_after_pick(thr: float, scores: np.ndarray) -> float:
+    if not np.isfinite(thr):
+        smax = float(np.max(scores)) if scores.size else 0.0
+        return float(np.nextafter(smax, np.float32(-np.inf)))
+    smax = float(np.max(scores)) if scores.size else 0.0
+    if thr > smax:
+        return float(np.nextafter(smax, np.float32(-np.inf)))
+    return float(thr)
+
+def _ensure_nonzero_tp(y_true: np.ndarray, scores: np.ndarray, thr: float) -> float:
+    yhat = (scores >= thr).astype(int)
+    tp = int(np.sum((yhat==1) & (y_true==1)))
+    if tp > 0:
+        return float(thr)
+    q = min(0.999, max(0.95, 1.0 - 10.0/ max((y_true==0).sum(), 1)))
+    thr2 = float(np.quantile(scores, q)) if scores.size else thr
+    return float(thr2)
+
 def pick_threshold_constrained(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]:
-    """
-    Escolhe threshold usando a curva ROC:
-      1) procura o maior TPR com FPR <= TARGET_FAR
-      2) se nenhum ponto satisfaz, escolhe o ponto com menor FPR possível
-         e dentre eles o maior TPR
-    Retorna (thr, info)
-    """
     y_true = np.asarray(y_true).astype(int)
     scores = np.asarray(scores).astype(float)
 
     if len(np.unique(y_true)) < 2:
-        # sem positivos ou sem negativos
         thr = float(np.percentile(scores, 99.9)) if scores.size > 0 else 0.0
         return thr, {"mode": "degenerate", "note": "labels not separable"}
 
     fpr, tpr, thr_arr = roc_curve(y_true, scores)
-    # sklearn retorna thresholds alinhados com fpr,tpr
-    # ordena por threshold crescente para consistencia
-    order = np.argsort(thr_arr)
-    fpr, tpr, thr_arr = fpr[order], tpr[order], thr_arr[order]
+    mask = (fpr <= CFG.TARGET_FAR) & np.isfinite(thr_arr)
+    if np.any(mask):
+        idx = np.argmax(tpr[mask])
+        thr = float(thr_arr[mask][idx])
+        info = {"mode": "constrained_roc", "target_fpr": CFG.TARGET_FAR,
+                "chosen_fpr": float(fpr[mask][idx]),
+                "chosen_tpr": float(tpr[mask][idx])}
+    else:
+        maskf = np.isfinite(thr_arr)
+        if not np.any(maskf):
+            thr = float(np.max(scores)) if scores.size else 0.0
+            info = {"mode": "constrained_roc", "note": "no finite threshold from ROC"}
+        else:
+            min_fpr = float(np.min(fpr[maskf]))
+            cand = np.where(maskf & (fpr == min_fpr))[0]
+            idx2 = cand[np.argmax(tpr[cand])]
+            thr = float(thr_arr[idx2])
+            info = {"mode": "relaxed_roc", "min_fpr": float(min_fpr), "chosen_tpr": float(tpr[idx2])}
 
-    mask_ok = fpr <= CFG.TARGET_FAR
-    if np.any(mask_ok):
-        idx = np.argmax(tpr[mask_ok])
-        thr = float(thr_arr[mask_ok][idx])
-        return thr, {"mode": "constrained_roc", "target_fpr": CFG.TARGET_FAR,
-                     "chosen_fpr": float(fpr[mask_ok][idx]),
-                     "chosen_tpr": float(tpr[mask_ok][idx])}
-
-    # relaxa para o menor FPR
-    min_fpr = np.min(fpr)
-    cand = np.where(fpr == min_fpr)[0]
-    idx2 = cand[np.argmax(tpr[cand])]
-    thr = float(thr_arr[idx2])
-    return thr, {"mode": "relaxed_roc", "min_fpr": float(min_fpr), "chosen_tpr": float(tpr[idx2])}
+    thr = _safe_thr_after_pick(thr, scores)
+    return thr, info
 
 def pick_threshold(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]:
     if CFG.MODE == "constrained_roc":
         return pick_threshold_constrained(y_true, scores)
+
     y_true = np.asarray(y_true).astype(int)
     scores = np.asarray(scores).astype(float)
 
@@ -690,7 +817,7 @@ def pick_threshold(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]
             return 0.0, {"mode": "target_far", "far": CFG.TARGET_FAR, "note": "no_neg"}
         q = 1.0 - CFG.TARGET_FAR
         thr = float(np.quantile(neg, q)) if neg.size > 10 else float(np.max(neg))
-        return thr, {"mode": "target_far", "far": CFG.TARGET_FAR}
+        return _safe_thr_after_pick(thr, scores), {"mode": "target_far", "far": CFG.TARGET_FAR}
 
     # best_f1
     thr_cand = np.unique(scores)
@@ -700,11 +827,12 @@ def pick_threshold(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]
         tp = int(np.sum((yhat == 1) & (y_true == 1)))
         fp = int(np.sum((yhat == 1) & (y_true == 0)))
         fn = int(np.sum((yhat == 0) & (y_true == 1)))
-        prec = tp / (tp + fp + 1e-12)
+        prec = tp / (t + fp + 1e-12)
         rec  = tp / (tp + fn + 1e-12)
         f1 = 2 * prec * rec / (prec + rec + 1e-12)
         if f1 > best_f1:
             best_f1, best_thr = f1, float(t)
+    best_thr = _safe_thr_after_pick(best_thr, scores)
     return best_thr, {"mode": "best_f1", "f1": best_f1}
 
 def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, prefix: str):
@@ -715,7 +843,7 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
     ap  = average_precision_score(y_true, scores) if len(np.unique(y_true)) > 1 else float("nan")
 
     try:
-        fpr, tpr, thr = roc_curve(y_true, scores)
+        fpr, tpr, _ = roc_curve(y_true, scores)
         plt.figure(figsize=(4.8,4.6))
         plt.plot(fpr, tpr, label=f"AUC={auc:.3f}")
         plt.plot([0,1],[0,1],'k:',alpha=.4)
@@ -739,8 +867,11 @@ def summarize_and_plot(y_true: np.ndarray, scores: np.ndarray, out_dir: str, pre
 
     try:
         plt.figure(figsize=(6.2,3.6))
-        plt.hist(scores[y_true==0], bins=60, alpha=.7, label="neg", density=True, color="#2563eb")
-        plt.hist(scores[y_true==1], bins=60, alpha=.7, label="pos", density=True, color="#ef4444")
+        neg = scores[y_true==0]; pos = scores[y_true==1]
+        if neg.size:
+            plt.hist(neg, bins=60, alpha=.7, label="neg", density=True, color="#2563eb")
+        if pos.size:
+            plt.hist(pos, bins=60, alpha=.7, label="pos", density=True, color="#ef4444")
         plt.legend(); plt.grid(alpha=.2); plt.title(f"Score dist - {prefix}")
         plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"hist_{prefix}.png"), dpi=140); plt.close()
     except Exception:
@@ -755,6 +886,27 @@ def confusion_at_threshold(y_true: np.ndarray, scores: np.ndarray, thr: float):
     fn = int(np.sum((yhat==0) & (y_true==1)))
     tp = int(np.sum((yhat==1) & (y_true==1)))
     return tn, fp, fn, tp
+
+def thresholds_report_grid(y_true: np.ndarray, scores: np.ndarray, fars=(1e-6,5e-6,1e-5,5e-4,1e-3,5e-3,1e-2)):
+    y_true = np.asarray(y_true).astype(int)
+    scores = np.asarray(scores).astype(float)
+    out = {}
+    neg = scores[y_true==0]
+    for far in fars:
+        if neg.size == 0:
+            out[str(far)] = {"threshold": None, "fpr": 0.0, "tpr": 0.0}
+            continue
+        thr = float(np.quantile(neg, 1.0 - far)) if neg.size > 10 else float(np.max(neg))
+        thr = _safe_thr_after_pick(thr, scores)
+        yhat = (scores >= thr).astype(int)
+        tn = int(np.sum((yhat==0) & (y_true==0)))
+        fp = int(np.sum((yhat==1) & (y_true==0)))
+        fn = int(np.sum((yhat==0) & (y_true==1)))
+        tp = int(np.sum((yhat==1) & (y_true==1)))
+        fpr = fp / max(tn+fp, 1)
+        tpr = tp / max(tp+fn, 1)
+        out[str(far)] = {"threshold": thr, "fpr": float(fpr), "tpr": float(tpr), "tp": tp, "fp": fp}
+    return out
 
 # =========================
 # INJECT sweep
@@ -797,6 +949,121 @@ def inject_sweep_quick(idx_map: Dict[str,str], tmpl_cache: Dict[str,np.ndarray])
         print(f"[INJECT] falhou: {e}")
 
 # =========================
+# N1: amostragem estratificada para sweep
+# =========================
+def _build_val_for_sweep(df_val_full: pd.DataFrame) -> pd.DataFrame:
+    rs = np.random.RandomState(CFG.SWEEP_RANDOM_SEED)
+    df_val_full = df_val_full.sample(frac=1.0, random_state=CFG.SWEEP_RANDOM_SEED).reset_index(drop=True)
+
+    pos = df_val_full[df_val_full["label"].astype(int) == 1]
+    neg = df_val_full[df_val_full["label"].astype(int) == 0]
+
+    if len(pos) == 0:
+        print("[SWEEP] ATENCAO: VAL sem positivos. Sweep nao tera metricas validas.")
+        n_target = CFG.SWEEP_MAX_VAL_ROWS or len(df_val_full)
+        return df_val_full.head(n_target).copy()
+
+    take_pos = pos.copy()
+    n_neg_target = CFG.SWEEP_NEG_PER_POS * len(take_pos)
+
+    if CFG.SWEEP_MAX_VAL_ROWS:
+        n_neg_target = min(n_neg_target, max(0, CFG.SWEEP_MAX_VAL_ROWS - len(take_pos)))
+
+    n_neg = min(n_neg_target, len(neg))
+    take_neg = neg.sample(n=n_neg, random_state=CFG.SWEEP_RANDOM_SEED) if n_neg > 0 else neg.head(0)
+
+    df_mix = pd.concat([take_pos, take_neg], axis=0)
+    if CFG.SWEEP_MAX_VAL_ROWS and len(df_mix) < CFG.SWEEP_MAX_VAL_ROWS:
+        falta = CFG.SWEEP_MAX_VAL_ROWS - len(df_mix)
+        resto = df_val_full.drop(df_mix.index, errors="ignore")
+        if len(resto) > 0:
+            df_mix = pd.concat([df_mix, resto.sample(n=min(falta, len(resto)), random_state=CFG.SWEEP_RANDOM_SEED)], axis=0)
+
+    df_mix = df_mix.sample(frac=1.0, random_state=CFG.SWEEP_RANDOM_SEED).reset_index(drop=True)
+    dist = df_mix["label"].astype(int).value_counts().to_dict()
+    print(f"[SWEEP] VAL amostrado = {len(df_mix):,} | dist={dist}  (pos={len(take_pos)}, neg={len(df_mix)-len(take_pos)})")
+    return df_mix
+
+# =========================
+# N1: Varredura sistemática
+# =========================
+def run_val_once(df_val: pd.DataFrame, idx_map: Dict[str,str], out_dir: str,
+                 cache_name: Optional[str] = None) -> Dict:
+    bank = build_template_bank(CFG.TEMPLATES_N)
+    tmpl_cache = maybe_load_template_cache(out_dir, bank, cache_name)
+    s_val = score_subset("VAL", df_val, idx_map, tmpl_cache)
+    y_val = df_val["label"].to_numpy(int)
+    auc_val, ap_val = summarize_and_plot(y_val, s_val, out_dir, "val_probe")
+    rep = thresholds_report_grid(y_val, s_val, fars=(CFG.SWEEP_FAR,))
+    far_key = f"{CFG.SWEEP_FAR}"
+    rec_at_far = rep[far_key]["tpr"] if far_key in rep else float("nan")
+    fpr_at_far = rep[far_key]["fpr"] if far_key in rep else float("nan")
+    return {
+        "auc": float(auc_val), "ap": float(ap_val),
+        "recall_at_far": float(rec_at_far), "fpr_at_far": float(fpr_at_far),
+        "scores": s_val, "y": y_val
+    }
+
+def sweep_parameters(df_val_full: pd.DataFrame, idx_map: Dict[str,str], out_dir: str) -> Dict:
+    # novo: subset estratificado com todos os positivos e negativos controlados
+    df_val = _build_val_for_sweep(df_val_full)
+
+    grid = list(itertools.product(
+        CFG.SWEEP_GRID_M1,
+        CFG.SWEEP_GRID_M2,
+        CFG.SWEEP_GRID_TEMPLATES_N,
+        CFG.SWEEP_GRID_TEMPLATE_SUBSAMPLE,
+        CFG.SWEEP_GRID_TOPK
+    ))
+
+    rows = []
+    best = None
+    t_start = time.time()
+
+    for m1rng, m2rng, n_tmpl, subs, topk in grid:
+        t0 = time.time()
+        cache_name = cache_name_for(m1rng, m2rng, n_tmpl, subs)
+        with patch_cfg(
+            M1_RANGE=m1rng, M2_RANGE=m2rng,
+            TEMPLATES_N=n_tmpl, TEMPLATE_SUBSAMPLE=subs,
+            TOPK_POOL=topk,
+            CACHE_FILE=cache_name
+        ):
+            try:
+                res = run_val_once(df_val, idx_map, out_dir, cache_name=cache_name)
+                auc = res["auc"]; rec_far = res["recall_at_far"]; fpr_far = res["fpr_at_far"]
+                dt = time.time() - t0
+                row = {
+                    "m1_lo": m1rng[0], "m1_hi": m1rng[1],
+                    "m2_lo": m2rng[0], "m2_hi": m2rng[1],
+                    "templates_n": n_tmpl, "subsample": subs, "topk": topk,
+                    "metric": CFG.SWEEP_METRIC, "far": CFG.SWEEP_FAR,
+                    "auc": auc, "recall_at_far": rec_far, "fpr_at_far": fpr_far,
+                    "time_s": dt, "cache": cache_name
+                }
+                rows.append(row)
+                score_key = rec_far if CFG.SWEEP_METRIC == "recall_at_far" else auc
+                if best is None or score_key > best["score"]:
+                    best = {"score": score_key, "row": row}
+                _log(f"[SWEEP] n={n_tmpl} sub={subs} topk={topk} "
+                     f"m1={m1rng} m2={m2rng} "
+                     f"| AUC={auc:.4f} Rec@FAR={rec_far:.4f} "
+                     f"| {dt:.1f}s")
+            except Exception as e:
+                _log(f"[SWEEP] falha em {m1rng},{m2rng},n={n_tmpl},sub={subs},topk={topk}: {e}")
+                continue
+
+    if rows:
+        df_exp = pd.DataFrame(rows)
+        df_exp.to_csv(os.path.join(out_dir, "experiments.csv"), index=False)
+    if best is None:
+        raise RuntimeError("SWEEP não produziu resultados")
+
+    _log(f"[SWEEP] total combos={len(rows)} tempo_total={time.time()-t_start:.1f}s")
+    _log(f"[SWEEP] melhor={best['row']}")
+    return best["row"]
+
+# =========================
 # MAIN
 # =========================
 def main():
@@ -804,9 +1071,15 @@ def main():
     t_all = time.time()
     out_dir = os.path.join(CFG.OUT_DIR_ROOT, ts_tag()); ensure_dir(out_dir)
 
+    # 0) log de ambiente
+    _log("============= PIPELINE GLOBAL =============")
+    _log(f"GPU solicitado={CFG.USE_GPU} disponivel={_HAS_CUPY}" + (f" | nota={_CUPY_ERR}" if (_CUPY_ERR and not _HAS_CUPY) else ""))
+    _log(f"NAT solicitado={CFG.USE_NATIVE_NCC} disponivel={_HAS_NATIVE}" + (f" | nota={_NATIVE_ERR}" if (_NATIVE_ERR and not _HAS_NATIVE) else ""))
+    _log(f"WINDOW_SEC={CFG.WINDOW_SEC} FS_TARGET={CFG.FS_TARGET}")
+    _log("===========================================")
+
     # 1) Carrega dataset
     df = pd.read_parquet(CFG.PARQUET_PATH)
-
     if "subset" in df.columns:
         split_col = "subset"
     elif "split" in df.columns:
@@ -827,24 +1100,41 @@ def main():
         raise KeyError(f"colunas ausentes no dataset: {missing}")
 
     df = df[[split_col,"file_id","start_gps","label"]].copy()
-
     df_val  = df[df[split_col]=="val"].copy()
     df_test = df[df[split_col]=="test"].copy()
     if CFG.MAX_VAL_ROWS:  df_val  = df_val.head(CFG.MAX_VAL_ROWS).copy()
     if CFG.MAX_TEST_ROWS: df_test = df_test.head(CFG.MAX_TEST_ROWS).copy()
-
     _log(f"[1/6] Dataset OK: val={len(df_val):,} | test={len(df_test):,}")
-    _log(f"[GPU] solicitado={CFG.USE_GPU} | disponivel={_HAS_CUPY}" + (f" | nota={_CUPY_ERR}" if (_CUPY_ERR and not _HAS_CUPY) else ""))
 
-    # 2) Index e templates
+    # 2) Index de windows
     _log("[2/6] Indexando *_windows.hdf5 ...")
     idx_map = build_windows_index(CFG.WINDOWS_DIR)
     if not idx_map: raise RuntimeError("nenhum *_windows.hdf5 encontrado em WINDOWS_DIR")
 
+    # N1) Varredura sistemática
+    if CFG.SWEEP_ENABLED:
+        _log("[SWEEP] Iniciando varredura sistemática em VAL...")
+        best_row = sweep_parameters(df_val, idx_map, out_dir)
+        with patch_cfg(
+            M1_RANGE=(best_row["m1_lo"], best_row["m1_hi"]),
+            M2_RANGE=(best_row["m2_lo"], best_row["m2_hi"]),
+            TEMPLATES_N=int(best_row["templates_n"]),
+            TEMPLATE_SUBSAMPLE=int(best_row["subsample"]),
+            TOPK_POOL=int(best_row["topk"]),
+            CACHE_FILE=str(best_row["cache"])
+        ):
+            _run_final(df_val, df_test, idx_map, out_dir, sweep_info=best_row)
+    else:
+        _run_final(df_val, df_test, idx_map, out_dir, sweep_info=None)
+
+    _log(f"Tempo total: {time.time()-t_all:.1f}s")
+
+def _run_final(df_val: pd.DataFrame, df_test: pd.DataFrame, idx_map: Dict[str,str],
+               out_dir: str, sweep_info: Optional[Dict]):
+    # 3) Templates e self-test
     _log("[2/6] Templates ...")
     bank = build_template_bank(CFG.TEMPLATES_N)
-    tmpl_cache = maybe_load_template_cache(out_dir, bank)
-    total_templates = len(tmpl_cache)
+    tmpl_cache = maybe_load_template_cache(out_dir, bank, cache_name=CFG.CACHE_FILE)
 
     # Self-test robusto
     try:
@@ -874,20 +1164,23 @@ def main():
     if CFG.DO_INJECT_SWEEP:
         inject_sweep_quick(idx_map, tmpl_cache)
 
-    # 3) VAL
+    # 4) VAL
     _log("[3/6] Scoring VAL ...")
     s_val = score_subset("VAL", df_val, idx_map, tmpl_cache)
     print(f"[VAL] scores: min={s_val.min():.4g} med={np.median(s_val):.4g} max={s_val.max():.4g} | frac(>1e-6)={(s_val>1e-6).mean()*100:.3f}%")
 
-    # 4) Thresholds
+    # 5) Thresholds
     _log("[4/6] Thresholds no VAL ...")
     y_val = df_val["label"].to_numpy(int)
     thr, info = pick_threshold(y_val, s_val)
+    thr = _ensure_nonzero_tp(y_val, s_val, thr)
     auc_val, ap_val = summarize_and_plot(y_val, s_val, out_dir, "val")
     df_val_out = df_val.copy(); df_val_out["score"] = s_val
     df_val_out.to_csv(os.path.join(out_dir, "scores_val.csv"), index=False)
 
-    # 5) TEST
+    far_report = thresholds_report_grid(y_val, s_val)
+
+    # 6) TEST
     _log("[5/6] Scoring TEST ...")
     s_test = score_subset("TEST", df_test, idx_map, tmpl_cache)
     print(f"[TEST] scores: min={s_test.min():.4g} med={np.median(s_test):.4g} max={s_test.max():.4g} | frac(>1e-6)={(s_test>1e-6).mean()*100:.3f}%")
@@ -896,22 +1189,34 @@ def main():
     df_test_out = df_test.copy(); df_test_out["score"] = s_test
     df_test_out.to_csv(os.path.join(out_dir, "scores_test.csv"), index=False)
 
-    # 6) Relatorio
+    # 7) Relatorio final
     _log("[6/6] Salvando relatorio ...")
     tn, fp, fn, tp = confusion_at_threshold(y_test, s_test, thr)
     summary = {
         "cfg": asdict(CFG),
-        "templates_cached": int(total_templates),
+        "templates_cached": int(len(tmpl_cache)),
         "val": {"auc": float(auc_val), "ap": float(ap_val)},
         "test": {"auc": float(auc_test), "ap": float(ap_test),
                  "confusion_at_thr": {"tn": tn, "fp": fp, "fn": fn, "tp": tp}},
         "threshold": float(thr),
         "threshold_info": info,
+        "val_far_report": far_report,
         "out_dir": out_dir,
-        "gpu": {"requested": bool(CFG.USE_GPU), "available": bool(_HAS_CUPY), "note": _CUPY_ERR}
+        "gpu": {"requested": bool(CFG.USE_GPU), "available": bool(_HAS_CUPY), "note": _CUPY_ERR},
+        "native": {"requested": bool(CFG.USE_NATIVE_NCC), "available": bool(_HAS_NATIVE), "note": _NATIVE_ERR},
+        "sweep_best": sweep_info
     }
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
+
+    with open(os.path.join(out_dir, "thresholds.json"), "w") as f:
+        json.dump({
+            "mode_used": CFG.MODE,
+            "chosen_threshold": float(thr),
+            "target_far": float(CFG.TARGET_FAR),
+            "val_far_report": far_report,
+            "notes": "thr ajustado com fallback para evitar tp=0 e thr=inf"
+        }, f, indent=2)
 
     if DEBUG_STRICT and (sum(FAIL_COUNTER.values()) > 0):
         dbg_dir = os.path.join(out_dir, "_debug")
@@ -927,10 +1232,9 @@ def main():
 
     _log("\n[OK] MF concluido.")
     _log(f" Saida: {out_dir}")
-    _log(f" Templates: {total_templates} | fs={CFG.FS_TARGET} Hz | lag_step={CFG.LAG_STEP} | ±shift={CFG.MAX_SHIFT_SEC}s | GPU={CFG.USE_GPU and _HAS_CUPY}")
+    _log(f" Templates: {len(tmpl_cache)} | fs={CFG.FS_TARGET} Hz | lag_step={CFG.LAG_STEP} | ±shift={CFG.MAX_SHIFT_SEC}s | GPU={CFG.USE_GPU and _HAS_CUPY}")
     _log(f" Val AUC={auc_val:.4g} AP={ap_val:.4g} | Test AUC={auc_test:.4g} AP={ap_test:.4g}")
     _log(f" Confusion@test_thr: tn={tn} fp={fp} fn={fn} tp={tp}")
-    _log(f" Tempo total: {time.time()-t_all:.1f}s")
 
 if __name__ == "__main__":
     main()
