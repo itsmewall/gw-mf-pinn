@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 import requests
 from tqdm import tqdm
+import numpy as np
+import pandas as pd
 
 # ============================================================
 # IMPORTA MODULOS DO PROJETO (ajusta sys.path)
@@ -34,7 +36,7 @@ from viz import plot_scores_timeline as viz_timeline
 from viz import ligo_overlay as viz_overlay
 
 # ============================================================
-# TOGGLES - ligue/desligue estágios
+# TOGGLES - ligue ou desligue estágios
 # ============================================================
 ENABLE_DOWNLOAD      = False   # baixa GWOSC
 ENABLE_WHITEN        = False   # pré-processa arquivos novos
@@ -42,7 +44,13 @@ ENABLE_WINDOWS       = True    # gera janelas para arquivos novos
 ENABLE_DATASET       = True    # recria dataset.parquet
 ENABLE_BASELINE_ML   = True    # roda baseline_ml.py
 ENABLE_MF_BASELINE   = True    # roda mf_baseline.py
-ENABLE_MF_STAGE2     = True    # roda mf Stage 2 (PyTorch)
+ENABLE_MF_STAGE2     = True    # roda MF Stage 2 em training/train_mf
+
+# Pós MF2
+ENABLE_POST_MF2_FREEZE    = True   # passo 1: congelar artefatos
+ENABLE_POST_MF2_EXPORT    = True   # passo 2: exportar candidatos
+ENABLE_POST_MF2_COINC     = True   # passo 3: coincidencia + FAR time slides
+ENABLE_POST_MF2_CALIBRATE = True   # passo 4: calibracao isotonica
 
 # PERFIL de download (se ENABLE_DOWNLOAD=True)
 PROFILE = "extended"            # "initial" | "extended" | "full"
@@ -80,7 +88,7 @@ else:
 STOP_SENTINEL = "STOP"         # criar um arquivo STOP na raiz interrompe downloads
 
 # ============================================================
-# PRE-PROCESSAMENTO
+# PRE PROCESSAMENTO
 # ============================================================
 LOWCUT       = 35.0
 HIGHCUT      = 350.0
@@ -92,7 +100,7 @@ PSD_SEG      = 4.0
 PSD_OVERLAP  = 0.5
 
 # ============================================================
-# JANELAMENTO / SNR
+# JANELAMENTO e SNR
 # ============================================================
 WINDOW_SEC     = 2.0
 STRIDE_SEC     = 0.5
@@ -192,6 +200,10 @@ def _summarize_latest_mf(logger):
         logger.info("-----------------------------------------")
     except Exception as e:
         logger.error(f"[MF] Falha ao ler summary.json: {e}")
+
+def _latest_mf2_run_dir() -> Optional[str]:
+    root = os.path.join(REPORTS_DIR, "mf_stage2")
+    return _latest_subdir(root)
 
 # ============================================================
 # API v2: eventos
@@ -440,6 +452,170 @@ def stage_mf_stage2(logger) -> Optional[str]:
         logger.error(f"[MF2] Execução falhou: {e}")
         return None
 
+# ------------------------------------------------------------
+# Pós MF2: FREEZE, EXPORT, COINC, CALIBRATE
+# ------------------------------------------------------------
+def stage_post_mf2_freeze(logger) -> Optional[str]:
+    if not ENABLE_POST_MF2_FREEZE:
+        logger.info("[MF2:FREEZE] desativado.")
+        return None
+    run = _latest_mf2_run_dir()
+    if not run:
+        logger.info("[MF2:FREEZE] nenhum run em reports/mf_stage2.")
+        return None
+    need = ["summary.json", "thresholds.json", "scores_val.csv", "scores_test.csv"]
+    missing = [n for n in need if not os.path.exists(os.path.join(run, n))]
+    if missing:
+        logger.info(f"[MF2:FREEZE] aguardando arquivos: {missing}. Pulando por enquanto.")
+        return None
+    out = os.path.join("artifacts", "mf2", os.path.basename(run.rstrip(os.sep)))
+    os.makedirs(out, exist_ok=True)
+    for n in need:
+        shutil.copy2(os.path.join(run, n), os.path.join(out, n))
+    for cfg in ("configs/train_mf.yaml", "configs/train_mf2.yaml"):
+        if os.path.exists(cfg):
+            shutil.copy2(cfg, os.path.join(out, os.path.basename(cfg)))
+    logger.info(f"[MF2:FREEZE] artefatos congelados em {out}")
+    return out
+
+def stage_post_mf2_export(logger) -> Optional[str]:
+    if not ENABLE_POST_MF2_EXPORT:
+        logger.info("[MF2:EXPORT] desativado.")
+        return None
+    run = _latest_mf2_run_dir()
+    if not run:
+        logger.info("[MF2:EXPORT] nenhum run em reports/mf_stage2.")
+        return None
+    thr_path  = os.path.join(run, "thresholds.json")
+    test_path = os.path.join(run, "scores_test.csv")
+    if not (os.path.exists(thr_path) and os.path.exists(test_path)):
+        logger.info("[MF2:EXPORT] thresholds.json ou scores_test.csv ausente.")
+        return None
+    with open(thr_path, "r") as f:
+        data_thr = json.load(f)
+    thr = data_thr.get("chosen_threshold", None)
+    if thr is None:
+        logger.info("[MF2:EXPORT] chosen_threshold ausente.")
+        return None
+    df = pd.read_csv(test_path)
+    if "score" not in df.columns:
+        logger.info("[MF2:EXPORT] scores_test.csv sem coluna score.")
+        return None
+    cand = df[df["score"] >= float(thr)].sort_values("score", ascending=False)
+    outdir = os.path.join(run, "candidates")
+    os.makedirs(outdir, exist_ok=True)
+    out = os.path.join(outdir, "test_candidates.csv")
+    cand.to_csv(out, index=False)
+    logger.info(f"[MF2:EXPORT] {len(cand)} candidatos salvos em {out}")
+    return out
+
+def _det_from_file_id(fid: str) -> str:
+    if "H1" in fid: return "H1"
+    if "L1" in fid: return "L1"
+    if "V1" in fid: return "V1"
+    m = re.search(r"([HLV]1)", fid)
+    return m.group(1) if m else "UNK"
+
+def _count_coinc(times_a, times_b, dt):
+    i = j = 0
+    n = 0
+    while i < len(times_a) and j < len(times_b):
+        da = times_a[i] - times_b[j]
+        if abs(da) <= dt:
+            n += 1; i += 1; j += 1
+        elif da > dt:
+            j += 1
+        else:
+            i += 1
+    return n
+
+def stage_post_mf2_coinc(logger, dt_sec: float = 0.015, slides: int = 100, slide_step: float = 1.3) -> Optional[str]:
+    if not ENABLE_POST_MF2_COINC:
+        logger.info("[MF2:COINC] desativado.")
+        return None
+    run = _latest_mf2_run_dir()
+    if not run:
+        logger.info("[MF2:COINC] nenhum run em reports/mf_stage2.")
+        return None
+    cand_path = os.path.join(run, "candidates", "test_candidates.csv")
+    if not os.path.exists(cand_path):
+        logger.info("[MF2:COINC] candidatos ausentes. Rode export primeiro.")
+        return None
+    df = pd.read_csv(cand_path)
+    need = {"file_id","start_gps","score"}
+    if not need.issubset(df.columns):
+        logger.info("[MF2:COINC] candidatos sem colunas esperadas.")
+        return None
+    df["det"] = df["file_id"].astype(str).map(_det_from_file_id)
+    tH = np.sort(df.loc[df["det"]=="H1","start_gps"].astype(float).values)
+    tL = np.sort(df.loc[df["det"]=="L1","start_gps"].astype(float).values)
+    if len(tH)==0 or len(tL)==0:
+        logger.info("[MF2:COINC] sem H1 e L1 suficientes.")
+        return None
+    tmin = max(tH.min(), tL.min()); tmax = min(tH.max(), tL.max())
+    Tobs = max(0.0, tmax - tmin)
+    if Tobs <= 0:
+        logger.info("[MF2:COINC] Tobs nao positivo.")
+        return None
+    n_real = _count_coinc(tH, tL, dt_sec)
+    rng = np.random.default_rng(42)
+    bg = []
+    for k in range(1, slides+1):
+        shift = (slide_step * k) + float(rng.uniform(0.1, 0.9))
+        bg.append(_count_coinc(tH, tL + shift, dt_sec))
+    bg = np.asarray(bg, float)
+    far = float(bg.mean() / Tobs) if Tobs > 0 else float("nan")
+    out = {
+        "dt_sec": float(dt_sec),
+        "slides": int(slides),
+        "slide_step_sec": float(slide_step),
+        "coinc_real": int(n_real),
+        "bg_mean": float(bg.mean()),
+        "bg_std": float(bg.std(ddof=1)) if len(bg)>1 else 0.0,
+        "Tobs_sec": float(Tobs),
+        "FAR_per_sec": far,
+        "FAR_per_day": far * 86400.0
+    }
+    out_path = os.path.join(run, "coincidence.json")
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    logger.info(f"[MF2:COINC] escrito {out_path}")
+    return out_path
+
+def stage_post_mf2_calibrate(logger) -> Optional[str]:
+    if not ENABLE_POST_MF2_CALIBRATE:
+        logger.info("[MF2:CALIB] desativado.")
+        return None
+    try:
+        from sklearn.isotonic import IsotonicRegression
+        from joblib import dump
+    except Exception as e:
+        logger.error(f"[MF2:CALIB] dependencias ausentes: {e}")
+        return None
+    run = _latest_mf2_run_dir()
+    if not run:
+        logger.info("[MF2:CALIB] nenhum run em reports/mf_stage2.")
+        return None
+    valp = os.path.join(run, "scores_val.csv")
+    tsp  = os.path.join(run, "scores_test.csv")
+    if not (os.path.exists(valp) and os.path.exists(tsp)):
+        logger.info("[MF2:CALIB] scores_val.csv ou scores_test.csv ausente.")
+        return None
+    val = pd.read_csv(valp); test = pd.read_csv(tsp)
+    if not {"score","label"}.issubset(val.columns):
+        logger.info("[MF2:CALIB] VAL sem score ou label.")
+        return None
+    y = val["label"].astype(int).values
+    s = val["score"].astype(float).values
+    cal = IsotonicRegression(out_of_bounds="clip").fit(s, y)
+    dump(cal, os.path.join(run, "calibrator_isotonic.joblib"))
+    val["p_mf2"] = cal.predict(val["score"].astype(float).values)
+    test["p_mf2"] = cal.predict(test["score"].astype(float).values)
+    val.to_csv(os.path.join(run, "scores_val_calibrated.csv"), index=False)
+    test.to_csv(os.path.join(run, "scores_test_calibrated.csv"), index=False)
+    logger.info("[MF2:CALIB] calibracao isotonica aplicada.")
+    return "ok"
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -491,15 +667,11 @@ def main():
     if tag_mf:
         logger.info(f"[MF] Concluído em {t():.1f}s")
         _summarize_latest_mf(logger)
-
-        # Viz: Timeline
         try:
-            logger.info("[VIZ] Gerando timeline de scores (MF/ML) …")
+            logger.info("[VIZ] Gerando timeline de scores (MF e ML) …")
             viz_timeline.main()
         except Exception as e:
             logger.error(f"[VIZ] timeline falhou: {e}")
-
-        # Viz: Overlay H1 L1
         try:
             logger.info("[VIZ] Gerando overlay H1 L1 …")
             viz_overlay.main()
@@ -511,6 +683,11 @@ def main():
     tag_mf2 = stage_mf_stage2(logger)
     if tag_mf2:
         logger.info(f"[MF2] Concluído em {t():.1f}s")
+        # Pós MF2
+        t = _timer(); stage_post_mf2_freeze(logger);    logger.info(f"[MF2:FREEZE] em {t():.1f}s")
+        t = _timer(); stage_post_mf2_export(logger);    logger.info(f"[MF2:EXPORT] em {t():.1f}s")
+        t = _timer(); stage_post_mf2_coinc(logger);     logger.info(f"[MF2:COINC] em {t():.1f}s")
+        t = _timer(); stage_post_mf2_calibrate(logger); logger.info(f"[MF2:CALIB] em {t():.1f}s")
 
     # RESUMO
     raw_count       = len(_list_files(os.path.join(DATA_RAW, "*.hdf5")))
