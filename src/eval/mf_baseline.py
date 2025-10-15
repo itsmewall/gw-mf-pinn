@@ -2,18 +2,17 @@
 # --------------------------------------------------------------------------------------
 # Matched-filter baseline via NCC
 # Recursos principais:
-#   - GPU via CuPy com fallback automático para CPU
+#   - GPU via CuPy com fallback automatico para CPU
 #   - CPU: nativo C++ OpenMP/pybind (accel.ncc_fft) para lags curtos, ou FFT NumPy
 #   - Autotuning de batch e templ_chunk com backoff em OOM
 #   - Index de windows por file_id e caches
-#   - Restrição de lag (±MAX_SHIFT_SEC) e passo LAG_STEP
+#   - Restricao de lag (±MAX_SHIFT_SEC) e passo LAG_STEP
 #   - Banco de templates IMRPhenomD com cache .npz
-#   - Self-test de injeção rápida
+#   - Self-test de injecao rapida
 #   - Pooling top-k entre templates
-#   - Três modos de threshold: constrained_roc, target_far, best_f1
-#   - Relatórios ROC, PR, histogramas, CSVs e thresholds.json
-#   - Sweep N1 com amostragem estratificada e checkpoints em CSV
-#   - Tolerância total: sem abortos manuais; exceções são capturadas e o run prossegue
+#   - Tres modos de threshold: constrained_roc, target_far, best_f1
+#   - Relatorios ROC, PR, histogramas, CSVs e thresholds.json
+#   - Tolerancia total: sem abortos manuais; excecoes sao capturadas e o run prossegue
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -77,7 +76,7 @@ except Exception as e:
     _HAS_NATIVE = False
 
 # =========================
-# Depuração global
+# Depuracao global
 # =========================
 DEBUG_STRICT = True
 FAIL_COUNTER: Counter = Counter()
@@ -99,18 +98,18 @@ class CFG:
 
     # GPU
     USE_GPU: bool = True
-    GPU_INIT_BATCH_WIN: int = 8192
+    GPU_INIT_BATCH_WIN: int = 2048
     GPU_MIN_BATCH_WIN: int  = 256
-    GPU_INIT_TEMPL_CHUNK: int = 128
+    GPU_INIT_TEMPL_CHUNK: int = 64
     GPU_MIN_TEMPL_CHUNK: int = 8
-    USE_FP16_TIME: bool = False
+    USE_FP16_TIME: bool = True
 
     # CPU nativo
     USE_NATIVE_NCC: bool = True
     NATIVE_MAXSHIFT_HEURISTIC: int = 128
 
     # banco de templates
-    TEMPLATES_N: int = 1024
+    TEMPLATES_N: int = 256
     TEMPLATE_SUBSAMPLE: int = 2
     M1_RANGE: Tuple[float, float] = (3.0, 80.0)
     M2_RANGE: Tuple[float, float] = (3.0, 80.0)
@@ -118,11 +117,11 @@ class CFG:
     SPIN2: float = 0.0
     F_LO: float = 20.0
     HP_WINDOW_TAPER: float = 0.1
-    CACHE_FILE: str = "templates_cache.npz"
+    CACHE_FILE: str = "tmplcache_n256_fs4096_w2.00.npz"
 
     # lags
     MAX_SHIFT_SEC: float = 0.02
-    LAG_STEP: int = 2
+    LAG_STEP: int = 4
 
     # veto de glitch
     ENABLE_GLITCH_VETO: bool = False
@@ -130,8 +129,8 @@ class CFG:
     GLITCH_VETO_KURT: float = 80.0
 
     # limites de linhas
-    MAX_VAL_ROWS: Optional[int] = None
-    MAX_TEST_ROWS: Optional[int] = None
+    MAX_VAL_ROWS: Optional[int] = 30000
+    MAX_TEST_ROWS: Optional[int] = 60000
 
     # thresholds
     MODE: str = "target_far"       # "constrained_roc" | "target_far" | "best_f1"
@@ -142,7 +141,7 @@ class CFG:
     TOPK_POOL: int = 1
 
     # injeções
-    DO_INJECT_SWEEP: bool = True
+    DO_INJECT_SWEEP: bool = False
     INJECT_N: int = 64
     INJECT_AMP: float = 0.6
     INJECT_EXPECT_MIN: float = 0.15
@@ -159,14 +158,12 @@ class CFG:
     HEARTBEAT_EVERY_SEC: float = 100.0
     TQDM_MIN_INTERVAL: float = 0.5
 
-    # Resiliência operacional
+    # Resiliencia operacional
     NO_ABORT: bool = True                # nunca abortar manualmente
     GPU_FALLBACK_TO_CPU: bool = True     # se GPU falhar, roda CPU automaticamente
 
-    # =========================
-    # N1: Varredura sistemática
-    # =========================
-    SWEEP_ENABLED: bool = True
+    # Sweep desligado definitivamente
+    SWEEP_ENABLED: bool = False
     SWEEP_MAX_VAL_ROWS: int = 30000
     SWEEP_NEG_PER_POS: int = 800
     SWEEP_RANDOM_SEED: int = 42
@@ -496,8 +493,7 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
     keys = list(tmpl_cache.keys())
     if CFG.TEMPLATE_SUBSAMPLE > 1:
         keys = keys[::CFG.TEMPLATE_SUBSAMPLE]
-    templates_host = [tmpl_cache[k] for k in keys]
-    K = len(templates_host)
+    K = len(keys)
 
     L = int(round(CFG.WINDOW_SEC * CFG.FS_TARGET))
     n_full = 2 * L - 1
@@ -523,6 +519,7 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
         while b0 < n:
             b_idx = idx[b0:b0+B_cur]
 
+            # Carrega batch de janelas no host
             X_host = []
             for i in b_idx:
                 fid  = df_sub.at[i, "file_id"]
@@ -544,9 +541,11 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 bar.update(len(b_idx)); b0 += B_cur; continue
 
             try:
+                # Stack somente validos
                 Xv = np.stack([x for x in X_host if x is not None], axis=0)
                 dtype_time = cp.float16 if CFG.USE_FP16_TIME else cp.float32
                 X_dev = cp.asarray(Xv, dtype=dtype_time)
+                # FFT e norma das janelas
                 X_fft = cp.fft.rfft(X_dev.astype(cp.float32, copy=False), nfft, axis=1)
                 X_norm = cp.linalg.norm(X_dev.astype(cp.float32, copy=False), axis=1).astype(cp.float32, copy=False)
 
@@ -556,32 +555,42 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 else:
                     agg = cp.full((X_dev.shape[0], topk), -cp.inf, dtype=cp.float32)
 
+                # Varre templates por chunks e precomputa FFT do chunk inteiro
                 for t0_idx in range(0, K, Kc_cur):
                     t1_idx = min(t0_idx + Kc_cur, K)
-                    for k in range(t0_idx, t1_idx):
-                        h = templates_host[k]
-                        h_dev = cp.asarray(h[::-1], dtype=cp.float32)
-                        H_fft = cp.fft.rfft(h_dev, nfft)
-                        C_fft = X_fft * cp.conj(H_fft)
-                        c = cp.fft.irfft(C_fft, nfft, axis=1)[:, :n_full]
-                        denom = (X_norm) * cp.linalg.norm(h_dev) + 1e-12
-                        c = c / denom[:, None]
-                        m = cp.max(c[:, lo:hi:lag_step], axis=1)
-                        if topk == 1:
-                            agg = cp.maximum(agg, m)
-                        else:
-                            min_idx = cp.argmin(agg, axis=1)
-                            rows = cp.arange(agg.shape[0])
-                            replace_mask = m > agg[rows, min_idx]
-                            agg[rows, min_idx] = cp.where(replace_mask, m, agg[rows, min_idx])
-                        del h_dev, H_fft, C_fft, c, m
-                        cp.get_default_memory_pool().free_all_blocks()
+                    ks_chunk = keys[t0_idx:t1_idx]
 
-                if topk == 1:
-                    best_host = agg.get()
-                else:
-                    best_host = cp.mean(agg, axis=1).get()
+                    # Templates no device, invertidos para correlacao, pilhados
+                    H_host = [tmpl_cache[k][::-1].astype(np.float32, copy=False) for k in ks_chunk]
+                    H_dev  = cp.asarray(np.stack(H_host, axis=0), dtype=cp.float32)              # [Kc, L]
+                    H_fft  = cp.fft.rfft(H_dev, nfft, axis=1)                                     # [Kc, F]
+                    H_norm = cp.linalg.norm(H_dev, axis=1).astype(cp.float32, copy=False)        # [Kc]
 
+                    # Correlaciona em lote: [B, F] x [Kc, F] -> [B, Kc, F]
+                    C_fft = X_fft[:, None, :] * cp.conj(H_fft[None, :, :])
+                    c     = cp.fft.irfft(C_fft, nfft, axis=2)[:, :, :n_full]                     # [B, Kc, n_full]
+                    denom = X_norm[:, None] * H_norm[None, :] + 1e-12
+                    c     = c / denom[:, :, None]
+
+                    m = cp.max(c[:, :, lo:hi:lag_step], axis=2)                                   # [B, Kc]
+
+                    if topk == 1:
+                        # melhor por janela neste chunk
+                        chunk_best = cp.max(m, axis=1)                                           # [B]
+                        agg = cp.maximum(agg, chunk_best)
+                    else:
+                        # mantem os top-k globais por janela
+                        topk_chunk = cp.partition(m, -topk, axis=1)[:, -topk:]                   # [B, k]
+                        cand = cp.concatenate([agg, topk_chunk], axis=1)                         # [B, 2k]
+                        agg  = cp.partition(cand, -topk, axis=1)[:, -topk:]                      # [B, k]
+
+                    # limpa para evitar OOM
+                    del H_dev, H_fft, H_norm, C_fft, c, m
+                    cp.get_default_memory_pool().free_all_blocks()
+
+                best_host = agg.get() if topk == 1 else cp.mean(agg, axis=1).get()
+
+                # Grava resultado nas posicoes originais do batch
                 pos_valid = np.where(mask_valid)[0]
                 for j, val in zip(pos_valid, best_host):
                     out_pos = df_sub.index.get_loc(b_idx[j])
@@ -766,7 +775,7 @@ def score_subset(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
             return score_subset_gpu_streaming(name, df_sub, idx_map, tmpl_cache)
         except Exception as e:
             if CFG.GPU_FALLBACK_TO_CPU:
-                _log(f"[{name}] GPU falhou de forma não tratada ({type(e).__name__}). Fallback CPU.")
+                _log(f"[{name}] GPU falhou de forma nao tratada ({type(e).__name__}). Fallback CPU.")
                 return score_subset_cpu(name, df_sub, idx_map, tmpl_cache)
             if CFG.NO_ABORT:
                 _log(f"[{name}] Erro grave na GPU. Zeros e seguir.")
@@ -775,7 +784,7 @@ def score_subset(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
     return score_subset_cpu(name, df_sub, idx_map, tmpl_cache)
 
 # =========================
-# Thresholds e métricas
+# Thresholds e metricas
 # =========================
 def _safe_thr_after_pick(thr: float, scores: np.ndarray) -> float:
     if not np.isfinite(thr):
@@ -832,7 +841,7 @@ def pick_threshold(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]
         neg = scores[y_true == 0]
         if neg.size == 0:
             return 0.0, {"mode": "target_far", "far": CFG.TARGET_FAR, "note": "no_neg"}
-        # pega threshold pela curva ROC no ponto mais próximo de FAR alvo
+        # threshold pelo ponto da ROC mais proximo de FAR alvo
         fpr, tpr, thr_arr = roc_curve(y_true, scores)
         i = int(np.argmin(np.abs(fpr - CFG.TARGET_FAR)))
         thr = float(thr_arr[max(0, min(i, len(thr_arr)-1))])
@@ -1030,103 +1039,23 @@ def _append_experiment(path_csv: str, row: dict):
         pass
 
 # =========================
-# N1: Varredura sistemática
+# Estratificacao para limitar linhas de VAL e TEST
 # =========================
-def run_val_once(df_val: pd.DataFrame, idx_map: Dict[str,str], out_dir: str,
-                 cache_name: Optional[str] = None) -> Dict:
-    bank = build_template_bank(CFG.TEMPLATES_N)
-    tmpl_cache = maybe_load_template_cache(out_dir, bank, cache_name)
-    s_val = score_subset("VAL", df_val, idx_map, tmpl_cache)
-    y_val = df_val["label"].to_numpy(int)
-    auc_val, ap_val = summarize_and_plot(y_val, s_val, out_dir, "val_probe")
-    rep = thresholds_report_grid(y_val, s_val, fars=(CFG.SWEEP_FAR,))
-    far_key = f"{CFG.SWEEP_FAR}"
-    rec_at_far = rep[far_key]["tpr"] if far_key in rep else float("nan")
-    fpr_at_far = rep[far_key]["fpr"] if far_key in rep else float("nan")
-    return {
-        "auc": float(auc_val), "ap": float(ap_val),
-        "recall_at_far": float(rec_at_far), "fpr_at_far": float(fpr_at_far),
-        "scores": s_val, "y": y_val
-    }
-
-def sweep_parameters(df_val_full: pd.DataFrame, idx_map: Dict[str,str], out_dir: str) -> Dict:
-    df_val = _build_val_for_sweep(df_val_full)
-
-    grid = list(itertools.product(
-        CFG.SWEEP_GRID_M1,
-        CFG.SWEEP_GRID_M2,
-        CFG.SWEEP_GRID_TEMPLATES_N,
-        CFG.SWEEP_GRID_TEMPLATE_SUBSAMPLE,
-        CFG.SWEEP_GRID_TOPK
-    ))
-
-    rows = []
-    best = None
-    t_start = time.time()
-    exp_csv = os.path.join(out_dir, "experiments.csv")
-    seen = _load_existing_experiments(exp_csv)
-
-    for m1rng, m2rng, n_tmpl, subs, topk in grid:
-        row_stub = {
-            "m1_lo": m1rng[0], "m1_hi": m1rng[1],
-            "m2_lo": m2rng[0], "m2_hi": m2rng[1],
-            "templates_n": n_tmpl, "subsample": subs, "topk": topk,
-            "metric": CFG.SWEEP_METRIC, "far": CFG.SWEEP_FAR
-        }
-        if _exp_key(row_stub) in seen:
-            rprev = seen[_exp_key(row_stub)]
-            rows.append(rprev)
-            score_key = rprev["recall_at_far"] if CFG.SWEEP_METRIC == "recall_at_far" else rprev["auc"]
-            if best is None or float(score_key) > float(best["score"]):
-                best = {"score": float(score_key), "row": rprev}
-            _log(f"[SWEEP] pulando repetido {row_stub} (checkpoint)")
-            continue
-
-        t0 = time.time()
-        cache_name = cache_name_for(m1rng, m2rng, n_tmpl, subs)
-        with patch_cfg(
-            M1_RANGE=m1rng, M2_RANGE=m2rng,
-            TEMPLATES_N=n_tmpl, TEMPLATE_SUBSAMPLE=subs,
-            TOPK_POOL=topk,
-            CACHE_FILE=cache_name
-        ):
-            try:
-                res = run_val_once(df_val, idx_map, out_dir, cache_name=cache_name)
-                auc = float(res["auc"]); rec_far = float(res["recall_at_far"]); fpr_far = float(res["fpr_at_far"])
-                dt = time.time() - t0
-                row = dict(row_stub, **{
-                    "auc": auc, "recall_at_far": rec_far, "fpr_at_far": fpr_far,
-                    "time_s": dt, "cache": cache_name
-                })
-                rows.append(row)
-                _append_experiment(exp_csv, row)
-                score_key = rec_far if CFG.SWEEP_METRIC == "recall_at_far" else auc
-                if best is None or score_key > best["score"]:
-                    best = {"score": score_key, "row": row}
-                _log(f"[SWEEP] n={n_tmpl} sub={subs} topk={topk} m1={m1rng} m2={m2rng} | AUC={auc:.4f} Rec@FAR={rec_far:.4f} | {dt:.1f}s")
-            except Exception as e:
-                _log(f"[SWEEP] falha em {m1rng},{m2rng},n={n_tmpl},sub={subs},topk={topk}: {e}")
-                if CFG.NO_ABORT:
-                    row = dict(row_stub, **{"auc": float("nan"), "recall_at_far": float("nan"),
-                                            "fpr_at_far": float("nan"), "time_s": -1.0, "cache": cache_name, "error": str(e)})
-                    rows.append(row)
-                    _append_experiment(exp_csv, row)
-                    continue
-                else:
-                    raise
-
-    if not rows:
-        raise RuntimeError("SWEEP não produziu resultados")
-    if best is None:
-        # fallback seguro: primeiro válido
-        valid = [r for r in rows if np.isfinite(r.get("recall_at_far", np.nan)) or np.isfinite(r.get("auc", np.nan))]
-        if not valid:
-            raise RuntimeError("SWEEP sem linhas válidas")
-        best = {"score": valid[0].get("recall_at_far", valid[0].get("auc", 0.0)), "row": valid[0]}
-
-    _log(f"[SWEEP] total combos={len(rows)} tempo_total={time.time()-t_start:.1f}s")
-    _log(f"[SWEEP] melhor={best['row']}")
-    return best["row"]
+def _cap_rows_stratified(df: pd.DataFrame, max_rows: Optional[int], seed: int = 42) -> pd.DataFrame:
+    if not max_rows or len(df) <= max_rows:
+        return df.copy()
+    y = df["label"].astype(int)
+    pos = df[y == 1]
+    neg = df[y == 0]
+    if len(pos) == 0:
+        return df.head(max_rows).copy()
+    take_pos = pos
+    need_neg = max_rows - len(take_pos)
+    if need_neg <= 0:
+        return take_pos.sample(n=max_rows, random_state=seed).reset_index(drop=True)
+    neg_sample = neg.sample(n=min(need_neg, len(neg)), random_state=seed)
+    out = pd.concat([take_pos, neg_sample], axis=0).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return out
 
 # =========================
 # MAIN
@@ -1167,8 +1096,11 @@ def main():
     df = df[[split_col,"file_id","start_gps","label"]].copy()
     df_val  = df[df[split_col]=="val"].copy()
     df_test = df[df[split_col]=="test"].copy()
-    if CFG.MAX_VAL_ROWS:  df_val  = df_val.head(CFG.MAX_VAL_ROWS).copy()
-    if CFG.MAX_TEST_ROWS: df_test = df_test.head(CFG.MAX_TEST_ROWS).copy()
+
+    # Limite estratificado que garante positivos
+    df_val  = _cap_rows_stratified(df_val,  CFG.MAX_VAL_ROWS)
+    df_test = _cap_rows_stratified(df_test, CFG.MAX_TEST_ROWS)
+
     _log(f"[1/6] Dataset OK: val={len(df_val):,} | test={len(df_test):,}")
 
     # 2) Index de windows
@@ -1176,9 +1108,10 @@ def main():
     idx_map = build_windows_index(CFG.WINDOWS_DIR)
     if not idx_map: raise RuntimeError("nenhum *_windows.hdf5 encontrado em WINDOWS_DIR")
 
-    # N1) Varredura sistemática
-    if CFG.SWEEP_ENABLED:
-        _log("[SWEEP] Iniciando varredura sistemática em VAL...")
+    # Sweep forcosamente desligado
+    SWEEP = False
+    if SWEEP and CFG.SWEEP_ENABLED:
+        _log("[SWEEP] Iniciando varredura sistematica em VAL...")
         best_row = sweep_parameters(df_val, idx_map, out_dir)
         with patch_cfg(
             M1_RANGE=(best_row["m1_lo"], best_row["m1_hi"]),
@@ -1254,7 +1187,7 @@ def _run_final(df_val: pd.DataFrame, df_test: pd.DataFrame, idx_map: Dict[str,st
     df_test_out = df_test.copy(); df_test_out["score"] = s_test
     df_test_out.to_csv(os.path.join(out_dir, "scores_test.csv"), index=False)
 
-    # 7) Relatório final
+    # 7) Relatorio final
     _log("[6/6] Salvando relatorio ...")
     tn, fp, fn, tp = confusion_at_threshold(y_test, s_test, thr)
     summary = {
