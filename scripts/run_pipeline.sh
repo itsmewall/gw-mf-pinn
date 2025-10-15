@@ -16,14 +16,19 @@ source "venv/bin/activate"
 
 python --version
 
-bash "export FAST_PIPELINE=0" # ativa otimizações
+# 2) FAST pipeline opcional
+# 1 = rápido para iteração; 0 = completo para resultados finais
+export FAST_PIPELINE=0
 
-# 2) Exporta libs de CUDA no WSL sem quebrar o sistema
-bash "scripts/cuda_env.sh"
+# 3) Carrega variáveis de CUDA no shell atual
+# use 'source' para persistir
+if [ -f scripts/cuda_env.sh ]; then
+  source scripts/cuda_env.sh
+fi
 
-# 3) Garante CuPy funcional. Não mata se falhar, o MF tem fallback
-bash "scripts/bootstrap_gpu.sh" "venv" || true
+# 4) Bootstrap GPU. Pode falhar sem abortar, MF tem fallback
+bash scripts/bootstrap_gpu.sh "venv" || true
 
-# 4) Roda o pipeline
+# 5) Roda o pipeline
 echo "[RUN] Iniciando pipeline…"
 python run.py
