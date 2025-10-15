@@ -16,6 +16,8 @@ source "venv/bin/activate"
 
 python --version
 
+bash "export FAST_PIPELINE=0" # ativa otimizações
+
 # 2) Exporta libs de CUDA no WSL sem quebrar o sistema
 bash "scripts/cuda_env.sh"
 
