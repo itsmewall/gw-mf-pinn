@@ -1,0 +1,4 @@
+# ninja log v7
+0	10231	1760557434410435645	CMakeFiles/gwphys_cuda.dir/gwphys_cuda.cu.o	b1b12ad566ac35b6
+10232	10334	1760557444642548219	CMakeFiles/gwphys_cuda.dir/cmake_device_link.o	4691abecae32035e
+10334	10555	1760557444742549319	/home/wallace/gw-mf-pinn/src/physics/gwphys_cuda.cpython-312-x86_64-linux-gnu.so	b5c86ec1e44d81d2

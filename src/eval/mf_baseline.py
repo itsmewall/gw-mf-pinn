@@ -104,7 +104,7 @@ class CFG:
     GPU_MIN_BATCH_WIN: int  = 256
     GPU_INIT_TEMPL_CHUNK: int = 128
     GPU_MIN_TEMPL_CHUNK: int = 8
-    GPU_VRAM_UTIL_FRAC: float = 0.85
+    GPU_VRAM_UTIL_FRAC: float = 0.95
     USE_FP16_TIME: bool = True
 
     # CPU nativo
@@ -123,7 +123,7 @@ class CFG:
     CACHE_FILE: str = "templates_cache.npz"
 
     # lags
-    MAX_SHIFT_SEC: float = 0.02
+    MAX_SHIFT_SEC: float = 0.015
     LAG_STEP: int = 4
 
     # veto de glitch

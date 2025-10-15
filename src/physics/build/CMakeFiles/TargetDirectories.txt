@@ -1,0 +1,3 @@
+/home/wallace/gw-mf-pinn/src/physics/build/CMakeFiles/gwphys_cuda.dir
+/home/wallace/gw-mf-pinn/src/physics/build/CMakeFiles/edit_cache.dir
+/home/wallace/gw-mf-pinn/src/physics/build/CMakeFiles/rebuild_cache.dir
