@@ -85,6 +85,68 @@ FAIL_COUNTER: Counter = Counter()
 FAIL_ROWS: List[dict] = []
 
 # =========================
+# FíSICA APLICADA
+# =========================
+
+try:
+    from physics import gwphys_cuda as gwcuda
+    HAVE_GWCUDA = True
+except Exception as e:
+    print("[MF] gwphys_cuda indisponível, usando CPU:", e)
+    HAVE_GWCUDA = False
+
+def cosine_scores(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    A = A.astype(np.float32, copy=False)
+    B = B.astype(np.float32, copy=False)
+    if HAVE_GWCUDA:
+        return gwcuda.cosine_scores_gpu(A, B)
+    # fallback CPU
+    num = A @ B.T
+    denom = np.linalg.norm(A, axis=1, keepdims=True) * np.linalg.norm(B, axis=1, keepdims=True).T + 1e-8
+    return num / denom
+
+def _preselect_templates(
+    X_batch: np.ndarray,            # [B, L] janelas já normalizadas do batch
+    tmpl_cache: Dict[str, np.ndarray],
+    topk: int
+) -> List[int]:
+    """
+    Retorna índices dos 'topk' templates mais promissores para o batch,
+    ranqueando pela média do |cosine| entre janelas e cada template.
+    """
+    keys_all = list(tmpl_cache.keys())
+    K = len(keys_all)
+    if (not CFG.PRESELECT_ENABLE) or (topk >= K) or (K == 0):
+        return list(range(K))
+
+    # monta banco [K, L]
+    T = np.stack([tmpl_cache[k] for k in keys_all], axis=0).astype(np.float32, copy=False)
+
+    # normaliza por segurança
+    def _safe_norm(x):
+        return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+    Xn = _safe_norm(X_batch.astype(np.float32, copy=False))
+    Tn = _safe_norm(T)
+
+    # GPU se disponível
+    use_cuda = bool(CFG.PRESELECT_USE_CUDA and HAVE_GWCUDA)
+    if use_cuda:
+        try:
+            S = gwcuda.cosine_scores_gpu(Xn, Tn)   # [B, K]
+        except Exception:
+            use_cuda = False
+
+    if not use_cuda:
+        S = (Xn @ Tn.T)  # [B, K] CPU
+
+    # rank global por média do |cos|
+    score = np.nanmean(np.abs(S), axis=0)  # [K]
+    topk = int(max(1, min(topk, K)))
+    idx = np.argpartition(score, -topk)[-topk:]
+    idx = idx[np.argsort(score[idx])]      # ordena asc
+    return idx.tolist()                    # índices em keys_all
+
+# =========================
 # CONFIG
 # =========================
 @dataclass
@@ -110,6 +172,12 @@ class CFG:
     # CPU nativo
     USE_NATIVE_NCC: bool = True
     NATIVE_MAXSHIFT_HEURISTIC: int = 128
+
+    # pré-seleção de templates por cosseno em GPU
+    PRESELECT_ENABLE: bool = True
+    PRESELECT_TOPK_TEMPL: int = 128        # número de templates que entram no NCC
+    PRESELECT_USE_CUDA: bool = True        # tenta gwphys_cuda
+
 
     # banco de templates
     TEMPLATES_N: int = 512
@@ -502,7 +570,7 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
     keys = list(tmpl_cache.keys())
     if CFG.TEMPLATE_SUBSAMPLE > 1:
         keys = keys[::CFG.TEMPLATE_SUBSAMPLE]
-    K = len(keys)
+    K_init = len(keys)  # tamanho antes da pré-seleção
 
     L = int(round(CFG.WINDOW_SEC * CFG.FS_TARGET))
     n_full = 2 * L - 1
@@ -518,8 +586,9 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
 
     topk = CFG.TOPK_POOL if CFG.TOPK_POOL and CFG.TOPK_POOL > 1 else 1
 
-    B_cur, Kc_cur, memi = _gpu_autotune_vram(L, F, n_full, topk, K)
-    _log(f"[{name}] janelas={n:,} | templates={K} | nfft={nfft} | max_shift={CFG.MAX_SHIFT_SEC:.3f}s | lag_step={lag_step} | GPU streaming")
+    # autotune inicial com o K antes da pré-seleção
+    B_cur, Kc_cur, memi = _gpu_autotune_vram(L, F, n_full, topk, K_init)
+    _log(f"[{name}] janelas={n:,} | templates={K_init} | nfft={nfft} | max_shift={CFG.MAX_SHIFT_SEC:.3f}s | lag_step={lag_step} | GPU streaming")
     _log(f"[{name}] VRAM livre={memi['free_gb']:.2f}GB (alvo {memi['target_gb']:.2f}GB) | perB≈{memi['perB_MB']:.1f}MB | perK≈{memi['perK_MB']:.1f}MB")
     _log(f"[{name}] autotune: batch_win={B_cur} | templ_chunk={Kc_cur} | fp16_time={CFG.USE_FP16_TIME}")
 
@@ -560,14 +629,34 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 X_fft = cp.fft.rfft(X_dev.astype(cp.float32, copy=False), nfft, axis=1)   # [B, F]
                 X_norm = cp.linalg.norm(X_dev.astype(cp.float32, copy=False), axis=1).astype(cp.float32, copy=False)
 
+                # Pré-seleção de templates neste batch
+                if CFG.PRESELECT_ENABLE:
+                    X_probe = Xv if Xv.shape[0] <= 512 else Xv[:512]
+                    sel_idx = _preselect_templates(X_probe, tmpl_cache, CFG.PRESELECT_TOPK_TEMPL)
+                    keys_selected = [keys[i] for i in sel_idx]
+                else:
+                    keys_selected = keys
+
+                K = len(keys_selected)
+                if K == 0:
+                    # nada a correlacionar - preenche com zero e segue
+                    pos_valid = np.where(mask_valid)[0]
+                    for j in pos_valid:
+                        out_pos = df_sub.index.get_loc(b_idx[j])
+                        scores[out_pos] = 0.0
+                    bar.update(len(b_idx)); b0 += B_cur; continue
+
+                # garante que o chunk não exceda K do batch
+                Kc_eff = max(CFG.GPU_MIN_TEMPL_CHUNK, min(Kc_cur, K))
+
                 if topk == 1:
                     agg = cp.full((X_dev.shape[0],), -cp.inf, dtype=cp.float32)        # [B]
                 else:
                     agg = cp.full((X_dev.shape[0], topk), -cp.inf, dtype=cp.float32)   # [B, k]
 
-                for t0_idx in range(0, K, Kc_cur):
-                    t1_idx = min(t0_idx + Kc_cur, K)
-                    ks_chunk = keys[t0_idx:t1_idx]
+                for t0_idx in range(0, K, Kc_eff):
+                    t1_idx = min(t0_idx + Kc_eff, K)
+                    ks_chunk = keys_selected[t0_idx:t1_idx]
 
                     H_host = [tmpl_cache[k][::-1].astype(np.float32, copy=False) for k in ks_chunk]
                     H_dev  = cp.asarray(np.stack(H_host, axis=0), dtype=cp.float32)            # [Kc, L]
@@ -724,6 +813,31 @@ def score_subset_cpu(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
     if CFG.TEMPLATE_SUBSAMPLE > 1:
         keys = keys[::CFG.TEMPLATE_SUBSAMPLE]
     templates_host = [tmpl_cache[k] for k in keys]
+
+    if CFG.PRESELECT_ENABLE and len(keys) > CFG.PRESELECT_TOPK_TEMPL:
+        # para CPU, faça uma sonda com até 512 janelas reais
+        probe_idx = df_sub.index[:min(512, len(df_sub))]
+        X_probe = []
+        for i in probe_idx:
+            fid  = df_sub.at[i, "file_id"]
+            sgps = float(df_sub.at[i, "start_gps"])
+            win_path = idx_map.get(fid)
+            if not win_path:
+                continue
+            _, _, meta_in = cached_start_arrays(win_path)
+            wht = resolve_whitened_path(win_path, meta_in)
+            if not wht or not os.path.exists(wht):
+                continue
+            x = load_window_slice(win_path, wht, sgps)
+            if x is None:
+                continue
+            X_probe.append(x.astype(np.float32, copy=False))
+        if len(X_probe) >= 8:
+            sel_idx = _preselect_templates(np.stack(X_probe, 0), tmpl_cache, CFG.PRESELECT_TOPK_TEMPL)
+            keys = [keys[i] for i in sel_idx]
+
+    templates_host = [tmpl_cache[k] for k in keys]
+
 
     fs = CFG.FS_TARGET
     max_shift = int(round(CFG.MAX_SHIFT_SEC * fs))
