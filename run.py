@@ -36,12 +36,13 @@ from viz import ligo_overlay as viz_overlay
 # ============================================================
 # TOGGLES - ligue/desligue estágios
 # ============================================================
-ENABLE_DOWNLOAD      = False   # baixa GWOSC (quota controlada)
-ENABLE_WHITEN        = False   # pré-processa (bandpass/PSD/whiten) só novos
-ENABLE_WINDOWS       = True   # gera janelas/SNR só novos
-ENABLE_DATASET       = True   # recria dataset.parquet
-ENABLE_BASELINE_ML   = True   # roda baseline_ml.py
+ENABLE_DOWNLOAD      = False   # baixa GWOSC
+ENABLE_WHITEN        = False   # pré-processa arquivos novos
+ENABLE_WINDOWS       = True    # gera janelas para arquivos novos
+ENABLE_DATASET       = True    # recria dataset.parquet
+ENABLE_BASELINE_ML   = True    # roda baseline_ml.py
 ENABLE_MF_BASELINE   = True    # roda mf_baseline.py
+ENABLE_MF_STAGE2     = True    # roda mf Stage 2 (PyTorch)
 
 # PERFIL de download (se ENABLE_DOWNLOAD=True)
 PROFILE = "extended"            # "initial" | "extended" | "full"
@@ -53,7 +54,7 @@ DATA_PROCESSED = os.path.join(ROOT, "data", "processed")
 REPORTS_DIR    = os.path.join(ROOT, "reports")
 LOG_DIR        = os.path.join(ROOT, "logs")
 
-# Preferências de arquivo (qualidade x tamanho)
+# Preferências de arquivo
 PREFER_HDF5           = True
 PREFER_4KHZ           = True
 PREFER_DURATION_4096S = True
@@ -61,7 +62,7 @@ ALLOW_DETECTORS       = {"H1", "L1"}   # inclua "V1" se quiser
 
 # Quotas por perfil
 if PROFILE == "initial":
-    MAX_DOWNLOAD_BYTES_PER_RUN = 10 * 1024**3  # 10 GB
+    MAX_DOWNLOAD_BYTES_PER_RUN = 10 * 1024**3
     MAX_EVENTS_PER_RUN         = 20
     MAX_FILES_PER_EVENT        = 2
     MAX_SINGLE_FILE_BYTES      = 1 * 1024**3
@@ -84,9 +85,9 @@ STOP_SENTINEL = "STOP"         # criar um arquivo STOP na raiz interrompe downlo
 LOWCUT       = 35.0
 HIGHCUT      = 350.0
 ORDER_BP     = 6
-FS_TARGET    = None            # sem resample aqui; só checa
+FS_TARGET    = None
 NOTCH_BASE   = 60.0
-NOTCH_HARMS  = 0               # BR: 0 ou 5 (60/120/180/240/300)
+NOTCH_HARMS  = 0
 PSD_SEG      = 4.0
 PSD_OVERLAP  = 0.5
 
@@ -95,8 +96,8 @@ PSD_OVERLAP  = 0.5
 # ============================================================
 WINDOW_SEC     = 2.0
 STRIDE_SEC     = 0.5
-SNR_THRESHOLD  = None          # ex.: 6.0 (opcional)
-SAVE_WINDOWS   = False         # True salva matrizes (grande)
+SNR_THRESHOLD  = None
+SAVE_WINDOWS   = False
 
 # ============================================================
 # GWOSC API v2
@@ -131,7 +132,7 @@ def _basename_from_url(url: str) -> str:
 
 def _enough_space(path: str, need_bytes: int) -> bool:
     total, used, free = shutil.disk_usage(os.path.abspath(path))
-    return (free - need_bytes) > 2 * 1024**3  # reserva 2 GB
+    return (free - need_bytes) > 2 * 1024**3
 
 def _match_detector_from_name(fname: str) -> Optional[str]:
     m = re.match(r"^[A-Z]-([HLV]1)_", os.path.basename(fname))
@@ -147,7 +148,6 @@ def _timer():
     t0 = time.time()
     return lambda: time.time() - t0
 
-# === ADD: helpers para resumir o MF ===
 def _latest_subdir(root: str) -> Optional[str]:
     if not os.path.isdir(root):
         return None
@@ -175,7 +175,6 @@ def _summarize_latest_mf(logger):
         conf = test.get("confusion_at_thr", {}) or {}
         tn, fp, fn, tp = (conf.get("tn",0), conf.get("fp",0), conf.get("fn",0), conf.get("tp",0))
 
-        # métricas derivadas no limiar utilizado
         prec = tp / max(tp+fp, 1)
         rec  = tp / max(tp+fn, 1)
         fpr  = fp / max(tn+fp, 1)
@@ -195,7 +194,7 @@ def _summarize_latest_mf(logger):
         logger.error(f"[MF] Falha ao ler summary.json: {e}")
 
 # ============================================================
-# API v2: eventos (paginado)
+# API v2: eventos
 # ============================================================
 def fetch_all_events(logger) -> List[str]:
     events: List[str] = []
@@ -273,7 +272,6 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
             logger.info(f"[GWOSC] {event}: já existe -> {fname} (pulando)")
             continue
 
-        # HEAD p/ tamanho
         try:
             head = requests.head(url, timeout=30, allow_redirects=True)
             head.raise_for_status()
@@ -368,9 +366,8 @@ def stage_windows(logger) -> List[str]:
     for wp in _list_files(os.path.join(DATA_INTERIM, "*_whitened.hdf5")):
         base = os.path.basename(wp).replace("_whitened.hdf5", "")
         out_path = os.path.join(DATA_PROCESSED, f"{base}_windows.hdf5")
-        if os.path.exists(out_path):  # já tem (índice leve)
+        if os.path.exists(out_path):
             try:
-                # garante meta mínima (source_path) p/ MF
                 from tools.fix_windows_meta import ensure_source_path_attr
                 ensure_source_path_attr(out_path)
             except Exception:
@@ -385,7 +382,6 @@ def stage_windows(logger) -> List[str]:
             save_windows=SAVE_WINDOWS,
         )
         if out:
-            # adiciona source_path meta
             try:
                 from tools.fix_windows_meta import ensure_source_path_attr
                 ensure_source_path_attr(out)
@@ -399,8 +395,7 @@ def stage_dataset(logger) -> Dict[str, int]:
         logger.info("[DS] Dataset builder desativado.")
         return {"rows": 0, "pos": 0}
     logger.info("[DS] Construindo dataset.parquet …")
-    dsb.main()  # usa as configs internas do dataset_builder
-    # tenta ler o meta JSON para dar feedback
+    dsb.main()
     meta_path = os.path.join(DATA_PROCESSED, "dataset_meta.json")
     if os.path.exists(meta_path):
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -417,7 +412,7 @@ def stage_baseline_ml(logger) -> Optional[str]:
         logger.info("[ML] Baseline ML desativado.")
         return None
     logger.info("[ML] Rodando baseline_ml …")
-    bml.main()  # salva em reports/baseline_ml/<timestamp> (no seu script)
+    bml.main()
     return "baseline_ml"
 
 def stage_mf_baseline(logger) -> Optional[str]:
@@ -425,8 +420,25 @@ def stage_mf_baseline(logger) -> Optional[str]:
         logger.info("[MF] Matched Filtering baseline desativado.")
         return None
     logger.info("[MF] Rodando mf_baseline …")
-    mbf.main()  # salva em reports/mf_baseline/<timestamp>
+    mbf.main()
     return "mf_baseline"
+
+def stage_mf_stage2(logger) -> Optional[str]:
+    if not ENABLE_MF_STAGE2:
+        logger.info("[MF2] Multi Fidelity Stage 2 desativado.")
+        return None
+    logger.info("[MF2] Treinando MF Stage 2 …")
+    try:
+        from training.train_mf import run_mf_stage2
+    except Exception as e:
+        logger.error(f"[MF2] Import falhou: {e}")
+        return None
+    try:
+        run_mf_stage2()
+        return "mf_stage2"
+    except Exception as e:
+        logger.error(f"[MF2] Execução falhou: {e}")
+        return None
 
 # ============================================================
 # MAIN
@@ -437,7 +449,11 @@ def main():
         os.makedirs(d, exist_ok=True)
 
     logger.info("============== PIPELINE GLOBAL ==============")
-    logger.info(f"Toggles: download={ENABLE_DOWNLOAD} | whiten={ENABLE_WHITEN} | windows={ENABLE_WINDOWS} | dataset={ENABLE_DATASET} | ML={ENABLE_BASELINE_ML} | MF={ENABLE_MF_BASELINE}")
+    logger.info(
+        "Toggles: "
+        f"download={ENABLE_DOWNLOAD} | whiten={ENABLE_WHITEN} | windows={ENABLE_WINDOWS} | "
+        f"dataset={ENABLE_DATASET} | ML={ENABLE_BASELINE_ML} | MF={ENABLE_MF_BASELINE} | MF2={ENABLE_MF_STAGE2}"
+    )
     logger.info(f"Profile={PROFILE} | RAW={DATA_RAW} | INTERIM={DATA_INTERIM} | PROCESSED={DATA_PROCESSED}")
     logger.info("=============================================")
 
@@ -476,19 +492,25 @@ def main():
         logger.info(f"[MF] Concluído em {t():.1f}s")
         _summarize_latest_mf(logger)
 
-        # Viz: Timeline (scores vs tempo)
+        # Viz: Timeline
         try:
             logger.info("[VIZ] Gerando timeline de scores (MF/ML) …")
             viz_timeline.main()
         except Exception as e:
             logger.error(f"[VIZ] timeline falhou: {e}")
 
-        # Viz: Overlay estilo LIGO (H1/L1)
+        # Viz: Overlay H1 L1
         try:
-            logger.info("[VIZ] Gerando overlay H1/L1 (estilo LIGO) …")
+            logger.info("[VIZ] Gerando overlay H1 L1 …")
             viz_overlay.main()
         except Exception as e:
             logger.error(f"[VIZ] overlay falhou: {e}")
+
+    # 7) MF STAGE 2
+    t = _timer()
+    tag_mf2 = stage_mf_stage2(logger)
+    if tag_mf2:
+        logger.info(f"[MF2] Concluído em {t():.1f}s")
 
     # RESUMO
     raw_count       = len(_list_files(os.path.join(DATA_RAW, "*.hdf5")))
@@ -500,7 +522,7 @@ def main():
     logger.info(f"INTERIM total:   {interim_count}")
     logger.info(f"PROCESSED total: {processed_count}")
     logger.info(f"Dataset:         linhas={ds_stats['rows']} | positivas={ds_stats['pos']}")
-    logger.info(f"Baselines:       ML={'ok' if tag_ml else '-'} | MF={'ok' if tag_mf else '-'}")
+    logger.info(f"Baselines:       ML={'ok' if tag_ml else '-'} | MF={'ok' if tag_mf else '-'} | MF2={'ok' if tag_mf2 else '-'}")
     logger.info(f"Tempo total:     {t_all():.1f} s")
     logger.info("============================================")
 
