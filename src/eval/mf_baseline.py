@@ -132,7 +132,7 @@ class CFG:
     GLITCH_VETO_KURT: float = 80.0
 
     # limites de linhas
-    MAX_VAL_ROWS: Optional[int] = 30000
+    MAX_VAL_ROWS: Optional[int] = None
     MAX_TEST_ROWS: Optional[int] = 60000
 
     # thresholds
