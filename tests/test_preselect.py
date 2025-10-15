@@ -1,7 +1,9 @@
 # tests/test_preselect.py
 import numpy as np
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve()).parents[1].joinpath("src").as_posix())
 from eval.mf_baseline import _preselect_templates, CFG
-from physics import gwphys_cuda as m  # garante import
+from physics import gwphys_cuda as m 
 
 def test_preselect():
     CFG.PRESELECT_ENABLE = True
