@@ -1,22 +1,26 @@
-# src/training/train_mf.py
-# =============================================================================
-# MF Stage 2 (Multi-Fidelity) - Treino rápido e estável
-# Lê dataset.parquet, carrega janelas HF do GWOSC e gera LF sintético.
-# Salva history.json, scores_{val,test}.csv, curvas ROC/PR e thresholds.json.
-# Pode ser chamado pelo run.py via: from training.train_mf import run_mf_stage2
-# =============================================================================
+# src/train/train_mf.py
+# ======================================================================================
+# Treinador Multi-Fidelity (MF1 + MF2) para detecção binária em janelas GW
+# - Sem CLI. Use a função train(hparams=None) chamada pelo seu run.py
+# - Lê dataset.parquet e *_windows.hdf5
+# - MF1: encoder raso e barato (low-fidelity)
+# - MF2: encoder mais profundo condicionado em MF1
+# - Perdas: BCE + consistência MF1↔MF2 + distil opcional via scores de baseline (csv)
+# - Amp mista, autocast, grad clip, checkpoint best por AP e por AUC
+# - Augment: time-shift, ruído gaussiano, dropout temporal
+# ======================================================================================
 
 from __future__ import annotations
-import os, json, time, math, warnings
+import os, time, json, math, random, pathlib, warnings
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Tuple, List
+from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
+import h5py
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from fractions import Fraction
+from scipy.signal import resample_poly
 
 import torch
 import torch.nn as nn
@@ -25,563 +29,513 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
 
-# Utilidades do MF1 para acessar janelas e índice
-from eval.mf_baseline import (
-    cached_start_arrays,
-    resolve_whitened_path,
-    load_window_slice,
-    build_windows_index,
-)
-
-# =============================================================================
-# Configuração
-# =============================================================================
-
+# =========================
+# Defaults
+# =========================
 @dataclass
-class MFCFG:
+class HParams:
+    # dados
     PARQUET_PATH: str = "data/processed/dataset.parquet"
-    WINDOWS_DIR: str   = "data/processed"
-    OUT_ROOT: str      = "reports/mf_stage2"
+    WINDOWS_DIR: str  = "data/processed"
+    FS_TARGET: int    = 4096
+    WINDOW_SEC: float = 2.0
+    SUBSETS: Tuple[str, ...] = ("train","val","test")
 
-    FS_TARGET: int     = 4096
-    WINDOW_SEC: float  = 2.0
-    N_LF: int          = 3
+    # treino
+    EPOCHS: int       = 12
+    BATCH: int        = 128
+    LR: float         = 2e-4
+    WD: float         = 1e-4
+    OPT: str          = "adamw"
+    AMP: bool         = True
+    GRAD_CLIP: float  = 1.0
+    NUM_WORKERS: int  = 4
+    PIN_MEMORY: bool  = True
+    SEED: int         = 2025
+    DEVICE: str       = "cuda"
 
-    EPOCHS: int        = 6
-    BATCH: int         = 128
-    LR: float          = 2e-3
-    WD: float          = 1e-3
-    NEG_PER_POS: int   = 50
-    NUM_WORKERS: int   = 4
-    MIXED_PREC: bool   = True
-    GRAD_CLIP: float   = 1.0
-    PREFETCH: int      = 2
-    PERSISTENT_WORKERS: bool = True
+    # perdas
+    W_BCE: float      = 1.0
+    W_CONSIST: float  = 0.2
+    W_DISTIL: float   = 0.3
 
-    # Perdas de consistência LF↔HF
-    LAMBDA_CONS: float = 0.2
-    LAMBDA_REP: float  = 0.1
+    # distil opcional
+    TEACHER_CSV_VAL: Optional[str] = None  # reports/.../scores_val.csv
+    TEACHER_CSV_TST: Optional[str] = None  # reports/.../scores_test.csv
+    TEACHER_COL: str = "score"             # coluna de score do baseline
 
-    SAVE_PREFIX: str   = "mf_stage2"
-    MAX_VAL_ROWS: Optional[int] = None
-    MAX_TEST_ROWS: int = 60000
+    # augment
+    AUG_TIMESHIFT_SEC: float = 0.010       # deslocamento aleatório máximo
+    AUG_GAUSS_STD: float    = 0.02         # ruído gaussiano std
+    TIME_DROPOUT_P: float   = 0.03         # zera pontos aleatórios
 
-    # Determinismo leve
-    SEED: int          = 42
+    # modelo
+    CH_MF1: int       = 32
+    CH_MF2: int       = 48
+    DROPOUT: float    = 0.05
 
-    # Threshold alvo para thresholds.json
-    TARGET_FAR: float  = 1e-4
-
-    # Aceleração opcional para geração de LF
-    USE_LF_CUDA: bool  = True  # tenta physics.gwphys_cuda se disponível
-    LF_KERNELS: Tuple[int, ...] = (4, 6, 8, 12, 16, 32)
-
-CFG = MFCFG()
-
-
-def _apply_fast_pipeline_overrides():
-    """Permite acelerar muito quando FAST_PIPELINE=1 no ambiente."""
-    fp = os.getenv("FAST_PIPELINE", "0")
-    if fp.strip() == "1":
-        # Ajustes conservadores para smoke test rápido
-        CFG.EPOCHS = min(CFG.EPOCHS, 2)
-        CFG.BATCH = min(CFG.BATCH, 96)
-        CFG.NEG_PER_POS = min(CFG.NEG_PER_POS, 15)
-        CFG.MAX_VAL_ROWS = 2000 if CFG.MAX_VAL_ROWS is None else min(CFG.MAX_VAL_ROWS, 2000)
-        CFG.MAX_TEST_ROWS = min(CFG.MAX_TEST_ROWS, 5000)
+    # saída
+    OUT_DIR: str      = "runs/mf"
+    SAVE_EVERY: int   = 1
 
 
+# =========================
+# Utilidades de dados
+# =========================
 def set_seed(seed: int):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+def _next_pow2(n: int) -> int:
+    return 1 << (int(n - 1).bit_length())
+
+def build_windows_index(windows_dir: str) -> Dict[str, str]:
+    idx: Dict[str, str] = {}
+    for root, _, files in os.walk(windows_dir):
+        for f in files:
+            if f.endswith("_windows.hdf5"):
+                idx[f] = os.path.abspath(os.path.join(root, f))
+    if not idx:
+        raise FileNotFoundError("Nenhum *_windows.hdf5 encontrado")
+    return idx
+
+def _read_attrs(obj) -> Dict[str, float | str]:
+    out = {}
+    try:
+        for k, v in obj.attrs.items():
+            if hasattr(v, "item"):
+                try: v = v.item()
+                except Exception: pass
+            out[str(k)] = v
+    except Exception:
+        pass
+    return out
+
+_cached_sgps: Dict[str, Tuple[np.ndarray, np.ndarray, Dict[str,str]]] = {}
+
+def _cached_start_arrays(win_path: str):
+    if win_path in _cached_sgps:
+        return _cached_sgps[win_path]
+    with h5py.File(win_path, "r") as f:
+        sgps = f["/windows/start_gps"][()].astype(float)
+        sidx = f["/windows/start_idx"][()].astype(int)
+        meta = _read_attrs(f["/meta_in"]) if "/meta_in" in f else {}
+    _cached_sgps[win_path] = (sgps, sidx, meta)
+    return _cached_sgps[win_path]
+
+def _resolve_whitened_path(win_path: str, meta_in: Dict[str,str]) -> Optional[str]:
+    src = meta_in.get("source_path") or meta_in.get("source_file") or meta_in.get("source")
+    candidates = []
+    if src and os.path.isabs(src): candidates.append(src)
+    if src:
+        candidates += [
+            os.path.join(os.path.dirname(win_path), src),
+            os.path.join("data", "interim", os.path.basename(src)),
+            os.path.join("data", "processed", os.path.basename(src)),
+        ]
+    bn = os.path.basename(win_path).replace("_windows.hdf5", "_whitened.hdf5")
+    candidates += [
+        os.path.join(os.path.dirname(win_path), bn),
+        os.path.join("data","interim", bn),
+        os.path.join("data","processed", bn),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c): return os.path.abspath(c)
+    return None
+
+def _load_window_slice(win_path: str, wht_path: str, start_gps: float, fs_tgt: int, win_sec: float) -> Optional[np.ndarray]:
+    try:
+        sgps, sidx, _ = _cached_start_arrays(win_path)
+        idxs = np.where(np.isclose(sgps, float(start_gps), atol=5e-4))[0]
+        if idxs.size == 0: return None
+        i0 = int(sidx[int(idxs[0])])
+
+        with h5py.File(wht_path, "r") as g:
+            cand = ["/strain/StrainWhitened","/strain/whitened","/data/whitened","/whitened","/strain/Strain"]
+            dset = None
+            for c in cand:
+                if c in g and isinstance(g[c], h5py.Dataset):
+                    dset = g[c]; break
+            if dset is None: return None
+            a_g = _read_attrs(g) | _read_attrs(dset)
+            fs_in = a_g.get("fs") or a_g.get("sample_rate")
+            if not fs_in:
+                xs = a_g.get("xspacing") or a_g.get("Xspacing")
+                if not xs: return None
+                fs_in = 1.0/float(xs)
+            fs_in = int(round(float(fs_in)))
+            wlen_in = int(round(win_sec*fs_in))
+            if i0 < 0 or (i0 + wlen_in) > int(dset.shape[0]): return None
+            x = dset[i0:i0+wlen_in].astype(np.float32, copy=True)
+
+        if fs_in != fs_tgt:
+            frac = Fraction(fs_tgt, fs_in).limit_denominator(64)
+            x = resample_poly(x, frac.numerator, frac.denominator).astype(np.float32, copy=False)
+
+        wlen = int(round(win_sec*fs_tgt))
+        if x.size > wlen: x = x[-wlen:]
+        elif x.size < wlen:
+            buf = np.zeros(wlen, np.float32); buf[-x.size:] = x; x = buf
+
+        if not np.any(np.isfinite(x)): return None
+        x -= x.mean()
+        x /= (x.std() + 1e-12)
+        return x
+    except Exception:
+        return None
 
 
-# =============================================================================
+# =========================
 # Dataset
-# =============================================================================
+# =========================
+class WindowsDS(Dataset):
+    def __init__(self,
+                 df: pd.DataFrame,
+                 win_index: Dict[str,str],
+                 fs_tgt: int,
+                 win_sec: float,
+                 teacher_map: Optional[Dict[Tuple[str,float], float]] = None,
+                 aug: bool = False,
+                 time_dropout_p: float = 0.0,
+                 timeshift_sec: float = 0.0,
+                 gauss_std: float = 0.0):
+        self.df = df.reset_index(drop=True).copy()
+        self.idx_map = win_index
+        self.fs = fs_tgt
+        self.sec = win_sec
+        self.teacher = teacher_map or {}
+        self.aug = aug
+        self.tdp = float(time_dropout_p)
+        self.tshift = float(timeshift_sec)
+        self.gstd = float(gauss_std)
 
-class PairedMFDataset(Dataset):
-    """
-    Para cada linha do parquet:
-      x_hf: janela real whitened e normalizada
-      x_lf: pilha de versões LF sintéticas com pooling médio e ruído leve
-    """
+        # cache por arquivo
+        self._wht_cache: Dict[str,str] = {}
 
-    def __init__(self, df: pd.DataFrame, idx_map: Dict[str, str], fs: int, window_sec: float, n_lf: int):
-        self.df = df.reset_index(drop=True)
-        self.idx_map = idx_map
-        self.fs = fs
-        self.L = int(round(window_sec * fs))
-        self.n_lf = n_lf
+    def __len__(self): return len(self.df)
 
-        # Tenta módulo CUDA opcional
-        self.have_gwcuda = False
-        self.use_gwcuda = False
-        if CFG.USE_LF_CUDA:
-            try:
-                from physics import gwphys_cuda as gwcuda  # type: ignore
-                self._gwcuda = gwcuda
-                self.have_gwcuda = True
-            except Exception:
-                self.have_gwcuda = False
-        # Só usa se existir e houver CUDA disponível
-        self.use_gwcuda = bool(self.have_gwcuda and torch.cuda.is_available())
+    def _get_wht(self, fid: str) -> Optional[str]:
+        if fid in self._wht_cache: return self._wht_cache[fid]
+        p = self.idx_map.get(fid); 
+        if not p: 
+            self._wht_cache[fid] = None; return None
+        _, _, meta = _cached_start_arrays(p)
+        wht = _resolve_whitened_path(p, meta)
+        self._wht_cache[fid] = wht
+        return wht
 
-    def __len__(self):
-        return len(self.df)
-
-    # Utilidades LF
-    @staticmethod
-    def _avg_pool_np(x: np.ndarray, k: int) -> np.ndarray:
-        if k <= 1:
-            return x
-        L = x.shape[-1]
-        m = L // k
-        if m <= 0:
-            return x
-        z = x[: m * k].reshape(m, k).mean(axis=1)
-        return np.repeat(z, k)[:L]
-
-    def _make_lf_stack_cpu(self, x: np.ndarray) -> np.ndarray:
-        pool_ks = list(CFG.LF_KERNELS)
-        out = []
-        rng = np.random.default_rng()
-        for _ in range(self.n_lf):
-            k = int(rng.choice(pool_ks))
-            y = self._avg_pool_np(x, k)
-            gain = float(rng.uniform(0.85, 1.15))
-            noise = rng.normal(0.0, 0.02, size=x.shape).astype(np.float32)
-            z = (gain * y + noise).astype(np.float32, copy=False)
-            z = (z - z.mean()) / (z.std() + 1e-12)
-            out.append(z)
-        return np.stack(out, axis=0)  # [n_lf, L]
-
-    def _make_lf_stack_cuda(self, x: np.ndarray) -> np.ndarray:
-        # Implementação opcional via GPU. Fallback se falhar.
-        try:
-            ks = np.asarray(CFG.LF_KERNELS, dtype=np.int32)
-            return self._gwcuda.make_lf_stack(x.astype(np.float32, copy=False), int(self.n_lf), ks)
-        except Exception:
-            return self._make_lf_stack_cpu(x)
-
-    def _load_hf(self, i: int) -> Optional[np.ndarray]:
-        r = self.df.iloc[i]
-        fid = r["file_id"]
-        sgps = float(r["start_gps"])
-        win_path = self.idx_map.get(fid)
-        if not win_path:
-            return None
-        _, _, meta_in = cached_start_arrays(win_path)
-        wht = resolve_whitened_path(win_path, meta_in)
-        if not wht or not os.path.exists(wht):
-            return None
-        x = load_window_slice(win_path, wht, sgps)
-        if x is None:
-            return None
-        return x.astype(np.float32, copy=False)
-
-    def __getitem__(self, i: int):
-        x = self._load_hf(i)
-        if x is None:
-            x = np.zeros(self.L, np.float32)
-        x_lf = self._make_lf_stack_cuda(x) if self.use_gwcuda else self._make_lf_stack_cpu(x)
-        y = int(self.df.iloc[i]["label"])
-        return torch.from_numpy(x_lf), torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
-
-
-# =============================================================================
-# Modelo
-# =============================================================================
-
-class SeparableConv1d(nn.Module):
-    def __init__(self, cin, cout, k, s=1, p=None):
-        super().__init__()
-        if p is None:
-            p = k // 2
-        self.dw = nn.Conv1d(cin, cin, k, s, p, groups=cin, bias=False)
-        self.pw = nn.Conv1d(cin, cout, 1, 1, 0, bias=False)
-        self.bn = nn.BatchNorm1d(cout)
-        self.act = nn.SiLU()
-
-    def forward(self, x):
-        x = self.dw(x)
-        x = self.pw(x)
-        x = self.bn(x)
-        return self.act(x)
-
-
-class Encoder1D(nn.Module):
-    def __init__(self, in_channels=1, width=64):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, width, 7, 2, 3, bias=False),
-            nn.BatchNorm1d(width),
-            nn.SiLU(),
-        )
-        self.block1 = nn.Sequential(
-            SeparableConv1d(width, width, 7, 1),
-            SeparableConv1d(width, width * 2, 5, 2),
-        )
-        self.block2 = nn.Sequential(
-            SeparableConv1d(width * 2, width * 2, 5, 1),
-            SeparableConv1d(width * 2, width * 4, 5, 2),
-        )
-        self.block3 = nn.Sequential(
-            SeparableConv1d(width * 4, width * 4, 3, 1),
-            SeparableConv1d(width * 4, width * 8, 3, 2),
-        )
-        self.head = nn.AdaptiveAvgPool1d(1)
-        self.out_dim = width * 8
-
-    def forward(self, x):  # [B, 1, L]
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.head(x).squeeze(-1)  # [B, C]
+    def _augment(self, x: np.ndarray) -> np.ndarray:
+        if self.tshift > 0.0:
+            max_shift = int(round(self.tshift * self.fs))
+            if max_shift > 0:
+                k = np.random.randint(-max_shift, max_shift+1)
+                if k != 0:
+                    x = np.roll(x, k)
+        if self.gstd > 0.0:
+            x = x + np.random.normal(0.0, self.gstd, size=x.shape).astype(np.float32)
+        if self.tdp > 0.0:
+            mask = np.random.rand(*x.shape) < self.tdp
+            x = x.copy(); x[mask] = 0.0
+        # re-normaliza leve
+        x = (x - x.mean()) / (x.std() + 1e-12)
         return x
 
+    def __getitem__(self, i: int):
+        row = self.df.iloc[i]
+        fid  = str(row["file_id"])
+        sgps = float(row["start_gps"])
+        y    = int(row["label"])
+        wht  = self._get_wht(fid)
+        if (not wht) or (not os.path.exists(wht)):
+            # fallback zero
+            L = int(round(self.sec*self.fs))
+            x = np.zeros(L, np.float32)
+        else:
+            win_path = self.idx_map.get(fid)
+            x = _load_window_slice(win_path, wht, sgps, self.fs, self.sec)
+            if x is None:
+                L = int(round(self.sec*self.fs))
+                x = np.zeros(L, np.float32)
+        if self.aug: x = self._augment(x)
+        t = torch.from_numpy(x).float().unsqueeze(0)  # [1, L]
+        teach = float(self.teacher.get((fid, sgps), np.nan))
+        return t, torch.tensor(y, dtype=torch.float32), teach, fid, sgps
 
-class MFNet(nn.Module):
-    def __init__(self, width=64):
+
+# =========================
+# Modelo MF
+# =========================
+class ConvBlock(nn.Module):
+    def __init__(self, c_in, c_out, k, s=1, p=None, dropout=0.0):
         super().__init__()
-        self.enc = Encoder1D(1, width=width)
-        self.fc = nn.Linear(self.enc.out_dim, 1)
+        if p is None: p = (k-1)//2
+        self.net = nn.Sequential(
+            nn.Conv1d(c_in, c_out, k, stride=s, padding=p, bias=False),
+            nn.BatchNorm1d(c_out),
+            nn.SiLU(),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x): return self.net(x)
 
-    def forward(self, x_hf, x_lf):
-        # x_hf: [B, 1, L]
-        # x_lf: [B, n_lf, 1, L]
-        B, nlf = x_lf.shape[0], x_lf.shape[1]
+class MFModel(nn.Module):
+    """
+    MF1: leve, gera feature z1 e um logit raso
+    MF2: mais profundo, recebe concat([x, up(z1)]) e gera logit final
+    """
+    def __init__(self, ch_mf1=32, ch_mf2=48, dropout=0.05):
+        super().__init__()
+        # MF1
+        self.mf1 = nn.Sequential(
+            ConvBlock(1, ch_mf1, 9, s=2, dropout=dropout),
+            ConvBlock(ch_mf1, ch_mf1, 7, s=2, dropout=dropout),
+            ConvBlock(ch_mf1, ch_mf1, 5, s=1, dropout=dropout),
+        )
+        self.mf1_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(ch_mf1, 1)
+        )
+        # MF2
+        self.proj_z1 = nn.Conv1d(ch_mf1, 16, kernel_size=1)
+        self.mf2 = nn.Sequential(
+            ConvBlock(1+16, ch_mf2, 9, s=2, dropout=dropout),
+            ConvBlock(ch_mf2, ch_mf2, 7, s=2, dropout=dropout),
+            ConvBlock(ch_mf2, ch_mf2, 5, s=1, dropout=dropout),
+            ConvBlock(ch_mf2, ch_mf2, 3, s=1, dropout=dropout),
+        )
+        self.mf2_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(ch_mf2, 1)
+        )
 
-        z_hf = self.enc(x_hf)                # [B, C]
-        logit_hf = self.fc(z_hf).squeeze(1)  # [B]
-
-        z_lfs = []
-        logits_lf = []
-        for i in range(nlf):
-            zi = self.enc(x_lf[:, i, :, :])
-            z_lfs.append(zi)
-            logits_lf.append(self.fc(zi).squeeze(1))
-        z_lf = torch.stack(z_lfs, dim=1).mean(dim=1)          # [B, C]
-        logit_lf = torch.stack(logits_lf, dim=1).mean(dim=1)  # [B]
-
-        return logit_hf, logit_lf, z_hf, z_lf
-
-
-# =============================================================================
-# Métricas e avaliação
-# =============================================================================
-
-def compute_metrics(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, float]:
-    y_true = y_true.astype(int)
-    if len(np.unique(y_true)) < 2:
-        return float("nan"), float("nan")
-    auc = roc_auc_score(y_true, scores)
-    ap = average_precision_score(y_true, scores)
-    return float(auc), float(ap)
-
-
-def plot_curves(y_true: np.ndarray, scores: np.ndarray, out_dir: str, prefix: str):
-    try:
-        fpr, tpr, _ = roc_curve(y_true.astype(int), scores.astype(float))
-        auc = roc_auc_score(y_true.astype(int), scores.astype(float)) if len(np.unique(y_true)) > 1 else float("nan")
-        plt.figure(figsize=(4.8, 4.6))
-        plt.plot(fpr, tpr, label=f"AUC={auc:.3f}")
-        plt.plot([0, 1], [0, 1], "k:", alpha=0.4)
-        plt.xlabel("FPR")
-        plt.ylabel("TPR")
-        plt.title(f"ROC - {prefix}")
-        plt.legend()
-        plt.grid(alpha=0.25)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"roc_{prefix}.png"), dpi=140)
-        plt.close()
-    except Exception:
-        pass
-
-    try:
-        prec, rec, _ = precision_recall_curve(y_true.astype(int), scores.astype(float))
-        ap = average_precision_score(y_true.astype(int), scores.astype(float)) if len(np.unique(y_true)) > 1 else float("nan")
-        plt.figure(figsize=(4.8, 4.6))
-        plt.plot(rec, prec, label=f"AP={ap:.3f}")
-        plt.xlabel("Recall")
-        plt.ylabel("Precision")
-        plt.title(f"PR - {prefix}")
-        plt.legend()
-        plt.grid(alpha=0.25)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"pr_{prefix}.png"), dpi=140)
-        plt.close()
-    except Exception:
-        pass
+    def forward(self, x):
+        # x: [B,1,L]
+        z1 = self.mf1(x)                            # [B,C1,L1]
+        y1 = self.mf1_head(z1).squeeze(-1)         # [B]
+        # upsample tosco por repetição para alinhar comprimentos
+        L = x.shape[-1]; L1 = z1.shape[-1]
+        up = F.interpolate(self.proj_z1(z1), size=max(L//4, L1), mode="nearest")
+        if up.shape[-1] != x.shape[-1]:
+            up = F.interpolate(up, size=L, mode="nearest")
+        h2 = self.mf2(torch.cat([x, up], dim=1))   # [B,C2,L2]
+        y2 = self.mf2_head(h2).squeeze(-1)         # [B]
+        return y1, y2, z1, h2
 
 
+# =========================
+# Métricas e loop
+# =========================
 @torch.no_grad()
-def evaluate(model: MFNet, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
+def eval_epoch(model, dl, device, amp=True):
     model.eval()
-    ys: List[np.ndarray] = []
-    ss: List[np.ndarray] = []
-    for x_lf, x_hf, y in loader:
-        x_hf = x_hf.unsqueeze(1).to(device, non_blocking=True)  # [B, 1, L]
-        x_lf = x_lf.unsqueeze(2).to(device, non_blocking=True)  # [B, n_lf, 1, L]
-        logit_hf, _, _, _ = model(x_hf, x_lf)
-        score = torch.sigmoid(logit_hf).detach().cpu().numpy()
-        ss.append(score)
-        ys.append(y.numpy())
-    if not ss:
-        return np.zeros(0, np.float32), np.zeros(0, np.float32)
-    ss = np.concatenate(ss, 0)
-    ys = np.concatenate(ys, 0)
-    return ys, ss
+    all_y, all_p = [], []
+    for xb, yb, _, _, _ in dl:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+            _, y2, _, _ = model(xb)
+        all_y.append(yb.detach().float().cpu().numpy())
+        all_p.append(torch.sigmoid(y2).detach().float().cpu().numpy())
+    y = np.concatenate(all_y) if all_y else np.zeros(0)
+    p = np.concatenate(all_p) if all_p else np.zeros(0)
+    if len(np.unique(y.astype(int))) >= 2:
+        auc = float(roc_auc_score(y, p))
+        ap  = float(average_precision_score(y, p))
+    else:
+        auc, ap = float("nan"), float("nan")
+    return {"auc": auc, "ap": ap, "n": int(y.size)}
+
+def make_teacher_map(csv_path: Optional[str], key_cols=("file_id","start_gps"), val_col="score"):
+    if not csv_path or not os.path.exists(csv_path): return {}
+    df = pd.read_csv(csv_path)
+    need = set(key_cols) | {val_col}
+    if not need.issubset(df.columns): return {}
+    out = {}
+    for _, r in df.iterrows():
+        fid = str(r[key_cols[0]]); sgps = float(r[key_cols[1]])
+        sc  = float(r[val_col])
+        out[(fid, sgps)] = sc
+    return out
 
 
-def pick_threshold_target_far(y_true: np.ndarray, scores: np.ndarray, far: float) -> float:
-    y_true = np.asarray(y_true).astype(int)
-    scores = np.asarray(scores).astype(float)
-    if scores.size == 0:
-        return 0.5
-    if len(np.unique(y_true)) < 2:
-        # dataset degenerado no VAL
-        return float(np.percentile(scores, 99.9))
-    fpr, tpr, thr = roc_curve(y_true, scores)
-    i = int(np.argmin(np.abs(fpr - far)))
-    t = float(thr[max(0, min(i, len(thr) - 1))])
-    smax = float(np.max(scores)) if scores.size else 0.0
-    if not np.isfinite(t) or (t > smax):
-        t = float(np.nextafter(smax, -np.inf))
-    return t
+def train(hparams: Optional[Dict] = None):
+    hp = HParams()
+    if hparams:
+        for k, v in hparams.items():
+            if hasattr(hp, k): setattr(hp, k, v)
 
+    set_seed(hp.SEED)
+    device = torch.device(hp.DEVICE if torch.cuda.is_available() and hp.DEVICE.startswith("cuda") else "cpu")
 
-# =============================================================================
-# Pipeline de treino
-# =============================================================================
-
-def build_train_subset(df_train: pd.DataFrame) -> pd.DataFrame:
-    pos = df_train[df_train["label"].astype(int) == 1]
-    neg = df_train[df_train["label"].astype(int) == 0]
-    if len(pos) == 0:
-        # sem positivos, faz um subset aleatório para evitar crash
-        return df_train.sample(n=min(len(df_train), 20000), random_state=CFG.SEED).reset_index(drop=True)
-    n_neg = min(len(neg), CFG.NEG_PER_POS * len(pos))
-    neg_ds = neg.sample(n=n_neg, random_state=CFG.SEED) if n_neg > 0 else neg
-    mix = pd.concat([pos, neg_ds], axis=0).sample(frac=1.0, random_state=CFG.SEED).reset_index(drop=True)
-    return mix
-
-
-def run_mf_stage2():
-    warnings.filterwarnings("ignore", category=UserWarning)
-    _apply_fast_pipeline_overrides()
-    set_seed(CFG.SEED)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_dtype = torch.float16
-
-    out_dir = os.path.join(CFG.OUT_ROOT, time.strftime("%Y%m%d-%H%M%S"))
+    # saída
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    out_dir = os.path.join(hp.OUT_DIR, ts)
     os.makedirs(out_dir, exist_ok=True)
 
-    print("============= MF Stage 2 =============")
-    print(f"Device: {device.type}")
-    print(f"Mixed precision: {CFG.MIXED_PREC}  AMP dtype: {'fp16' if amp_dtype == torch.float16 else 'fp32'}")
-    print(f"LF kernels: {CFG.LF_KERNELS}")
-    print("======================================")
+    # salva config
+    with open(os.path.join(out_dir, "hparams.json"), "w") as f:
+        json.dump(asdict(hp), f, indent=2)
 
-    # Carrega dataset
-    df = pd.read_parquet(CFG.PARQUET_PATH)
-    if "subset" in df.columns:
-        split_col = "subset"
-    elif "split" in df.columns:
-        df = df.rename(columns={"split": "subset"})
-        split_col = "subset"
+    # carrega dataset
+    df = pd.read_parquet(hp.PARQUET_PATH)
+    split_col = None
+    for c in ("subset","split"):
+        if c in df.columns:
+            split_col = c
+            break
+    if split_col == "split":
+        df = df.rename(columns={"split":"subset"}); split_col = "subset"
+    if split_col is None:
+        raise KeyError("dataset.parquet precisa ter coluna subset|split")
+
+    need_cols = {"file_id","start_gps","label","subset"}
+    if not need_cols.issubset(df.columns):
+        raise KeyError(f"Colunas ausentes no parquet: {need_cols - set(df.columns)}")
+
+    idx_map = build_windows_index(hp.WINDOWS_DIR)
+
+    # teacher maps
+    t_map_val = make_teacher_map(hp.TEACHER_CSV_VAL, val_col=hp.TEACHER_COL)
+    t_map_tst = make_teacher_map(hp.TEACHER_CSV_TST, val_col=hp.TEACHER_COL)
+
+    # splits
+    df_train = df[df["subset"]=="train"].copy()
+    df_val   = df[df["subset"]=="val"].copy()
+    df_test  = df[df["subset"]=="test"].copy()
+
+    ds_tr = WindowsDS(df_train, idx_map, hp.FS_TARGET, hp.WINDOW_SEC,
+                      teacher_map=None, aug=True,
+                      time_dropout_p=hp.TIME_DROPOUT_P,
+                      timeshift_sec=hp.AUG_TIMESHIFT_SEC,
+                      gauss_std=hp.AUG_GAUSS_STD)
+    ds_va = WindowsDS(df_val, idx_map, hp.FS_TARGET, hp.WINDOW_SEC,
+                      teacher_map=t_map_val or None, aug=False)
+    ds_te = WindowsDS(df_test, idx_map, hp.FS_TARGET, hp.WINDOW_SEC,
+                      teacher_map=t_map_tst or None, aug=False)
+
+    dl_tr = DataLoader(ds_tr, batch_size=hp.BATCH, shuffle=True,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY, drop_last=True)
+    dl_va = DataLoader(ds_va, batch_size=max(256, hp.BATCH), shuffle=False,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
+    dl_te = DataLoader(ds_te, batch_size=max(256, hp.BATCH), shuffle=False,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
+
+    # modelo e otimizador
+    model = MFModel(ch_mf1=hp.CH_MF1, ch_mf2=hp.CH_MF2, dropout=hp.DROPOUT).to(device)
+    if hp.OPT.lower() == "adamw":
+        opt = torch.optim.AdamW(model.parameters(), lr=hp.LR, weight_decay=hp.WD, betas=(0.9, 0.999))
     else:
-        raise KeyError("dataset.parquet precisa da coluna subset ou split")
+        opt = torch.optim.Adam(model.parameters(), lr=hp.LR, weight_decay=hp.WD)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(hp.EPOCHS, 1))
 
-    df = df[[split_col, "file_id", "start_gps", "label"]].copy()
-    df_train = df[df[split_col] == "train"].copy()
-    df_val = df[df[split_col] == "val"].copy()
-    df_test = df[df[split_col] == "test"].copy()
+    scaler = torch.cuda.amp.GradScaler(enabled=hp.AMP and device.type=="cuda")
 
-    if CFG.MAX_VAL_ROWS:
-        df_val = df_val.head(CFG.MAX_VAL_ROWS).copy()
-    if CFG.MAX_TEST_ROWS:
-        df_test = df_test.head(CFG.MAX_TEST_ROWS).copy()
+    bce = nn.BCEWithLogitsLoss()
 
-    # Constrói subset de treino balanceado
-    df_train_mix = build_train_subset(df_train)
+    best_ap, best_auc = -1.0, -1.0
+    best_ap_path = os.path.join(out_dir, "model_best_ap.pt")
+    best_auc_path = os.path.join(out_dir, "model_best_auc.pt")
 
-    # Index de arquivos de janelas
-    idx_map = build_windows_index(CFG.WINDOWS_DIR)
-    if not idx_map:
-        raise RuntimeError("nenhum *_windows.hdf5 encontrado em WINDOWS_DIR")
+    log_hist = []
 
-    # Datasets e loaders
-    ds_train = PairedMFDataset(df_train_mix, idx_map, CFG.FS_TARGET, CFG.WINDOW_SEC, CFG.N_LF)
-    ds_val = PairedMFDataset(df_val, idx_map, CFG.FS_TARGET, CFG.WINDOW_SEC, CFG.N_LF)
-    ds_test = PairedMFDataset(df_test, idx_map, CFG.FS_TARGET, CFG.WINDOW_SEC, CFG.N_LF)
-
-    # Número de workers seguro
-    num_workers = int(CFG.NUM_WORKERS)
-    if num_workers < 0:
-        # usa todos menos um, mas sem passar de 8
-        try:
-            import multiprocessing as mp
-            num_workers = max(0, min(8, mp.cpu_count() - 1))
-        except Exception:
-            num_workers = 0
-
-    loader_train = DataLoader(
-        ds_train,
-        batch_size=CFG.BATCH,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        prefetch_factor=CFG.PREFETCH if num_workers > 0 else None,
-        persistent_workers=(CFG.PERSISTENT_WORKERS and num_workers > 0),
-    )
-    loader_val = DataLoader(
-        ds_val,
-        batch_size=CFG.BATCH,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=CFG.PREFETCH if num_workers > 0 else None,
-        persistent_workers=(CFG.PERSISTENT_WORKERS and num_workers > 0),
-    )
-    loader_test = DataLoader(
-        ds_test,
-        batch_size=CFG.BATCH,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=CFG.PREFETCH if num_workers > 0 else None,
-        persistent_workers=(CFG.PERSISTENT_WORKERS and num_workers > 0),
-    )
-
-    # Modelo e otimizador
-    model = MFNet(width=64).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=CFG.LR, weight_decay=CFG.WD)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(CFG.EPOCHS, 1))
-    scaler = torch.cuda.amp.GradScaler(enabled=(CFG.MIXED_PREC and device.type == "cuda"))
-
-    # pos_weight para BCE por desbalanceamento do dataset de treino
-    n_pos = int((df_train_mix["label"] == 1).sum())
-    n_neg = int((df_train_mix["label"] == 0).sum())
-    pos_weight = torch.tensor([(n_neg + 1) / max(n_pos, 1)], device=device, dtype=torch.float32)
-
-    history: List[Dict] = []
-
-    for epoch in range(1, CFG.EPOCHS + 1):
+    for epoch in range(1, hp.EPOCHS+1):
         model.train()
         t0 = time.time()
         loss_meter = 0.0
-        it = 0
+        n_steps = 0
 
-        if len(loader_train) == 0:
-            print("[MF2] Aviso: loader de treino vazio. Pulando treino e seguindo para avaliação.")
-        else:
-            for x_lf, x_hf, y in loader_train:
-                x_hf = x_hf.unsqueeze(1).to(device, non_blocking=True)  # [B, 1, L]
-                x_lf = x_lf.unsqueeze(2).to(device, non_blocking=True)  # [B, n_lf, 1, L]
-                y = y.to(device, non_blocking=True).float()              # [B]
+        for xb, yb, tb, _, _ in dl_tr:
+            xb = xb.to(device, non_blocking=True)   # [B,1,L]
+            yb = yb.to(device, non_blocking=True)   # [B]
+            tb = torch.tensor(tb, dtype=torch.float32, device=device)  # [B]
 
-                opt.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(CFG.MIXED_PREC and device.type == "cuda")):
-                    logit_hf, logit_lf, z_hf, z_lf = model(x_hf, x_lf)
-                    Ldata = F.binary_cross_entropy_with_logits(logit_hf, y, pos_weight=pos_weight)
-                    Lcons = F.mse_loss(logit_lf, logit_hf)
-                    Lrep = F.mse_loss(z_lf, z_hf)
-                    loss = Ldata + CFG.LAMBDA_CONS * Lcons + CFG.LAMBDA_REP * Lrep
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=hp.AMP):
+                y1, y2, z1, h2 = model(xb)
+                loss_bce = bce(y2, yb)
 
-                scaler.scale(loss).backward()
-                if CFG.GRAD_CLIP and CFG.GRAD_CLIP > 0:
-                    scaler.unscale_(opt)
-                    nn.utils.clip_grad_norm_(model.parameters(), CFG.GRAD_CLIP)
-                scaler.step(opt)
-                scaler.update()
+                # consistência MF1 ↔ MF2: aproxima logits
+                loss_consist = F.mse_loss(torch.sigmoid(y1).detach(), torch.sigmoid(y2)) + \
+                               F.mse_loss(torch.sigmoid(y1), torch.sigmoid(y2).detach())
 
-                loss_meter += float(loss.detach().cpu().item())
-                it += 1
+                # distillation opcional se existir teacher em batch
+                has_teacher = torch.isfinite(tb)
+                if has_teacher.any():
+                    tnorm = torch.clamp((tb - 0.0) / 1.0, 0.0, 1.0)  # já está em [0,1] em geral
+                    loss_distil = F.mse_loss(torch.sigmoid(y2)[has_teacher], tnorm[has_teacher])
+                else:
+                    loss_distil = torch.tensor(0.0, device=device)
+
+                loss = hp.W_BCE*loss_bce + hp.W_CONSIST*loss_consist + hp.W_DISTIL*loss_distil
+
+            scaler.scale(loss).backward()
+            if hp.GRAD_CLIP and hp.GRAD_CLIP > 0:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), hp.GRAD_CLIP)
+            scaler.step(opt)
+            scaler.update()
+
+            loss_meter += float(loss.detach().cpu().item())
+            n_steps += 1
 
         sched.step()
         dt = time.time() - t0
 
-        # Avaliação por época
-        yv, sv = evaluate(model, loader_val, device)
-        yt, st = evaluate(model, loader_test, device)
-        auc_val, ap_val = compute_metrics(yv, sv) if yv.size else (float("nan"), float("nan"))
-        auc_test, ap_test = compute_metrics(yt, st) if yt.size else (float("nan"), float("nan"))
+        # avaliação
+        met_val = eval_epoch(model, dl_va, device, amp=hp.AMP)
+        met_tst = eval_epoch(model, dl_te, device, amp=hp.AMP)
 
-        history.append({
+        row = {
             "epoch": epoch,
-            "time_s": dt,
-            "train_loss": (loss_meter / max(it, 1)) if it > 0 else float("nan"),
-            "val_auc": auc_val, "val_ap": ap_val,
-            "test_auc": auc_test, "test_ap": ap_test,
-            "lr": float(sched.get_last_lr()[0]),
-        })
+            "loss": loss_meter/max(n_steps,1),
+            "lr": float(opt.param_groups[0]["lr"]),
+            "val_auc": met_val["auc"],
+            "val_ap": met_val["ap"],
+            "val_n": met_val["n"],
+            "test_auc": met_tst["auc"],
+            "test_ap": met_tst["ap"],
+            "test_n": met_tst["n"],
+            "time_s": dt
+        }
+        log_hist.append(row)
+        print(f"[MF][{epoch}/{hp.EPOCHS}] loss={row['loss']:.4f} valAUC={row['val_auc']:.4f} valAP={row['val_ap']:.4f} testAUC={row['test_auc']:.4f} testAP={row['test_ap']:.4f} {dt:.1f}s")
 
-        print(f"[MF2][{epoch}/{CFG.EPOCHS}] loss={history[-1]['train_loss']:.4f} "
-              f"val AUC={auc_val:.4f} AP={ap_val:.4f} | test AUC={auc_test:.4f} AP={ap_test:.4f} "
-              f"| {dt:.1f}s")
+        # checkpoints
+        if met_val["ap"] > best_ap:
+            best_ap = met_val["ap"]
+            torch.save({"epoch": epoch, "state_dict": model.state_dict(), "metrics": row}, best_ap_path)
+        if met_val["auc"] > best_auc:
+            best_auc = met_val["auc"]
+            torch.save({"epoch": epoch, "state_dict": model.state_dict(), "metrics": row}, best_auc_path)
 
-    # Saídas
-    with open(os.path.join(out_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
+        if (epoch % max(1, hp.SAVE_EVERY)) == 0:
+            cur_path = os.path.join(out_dir, f"model_ep{epoch:03d}.pt")
+            torch.save({"epoch": epoch, "state_dict": model.state_dict(), "metrics": row}, cur_path)
 
-    # Curvas finais e CSVs
-    yv, sv = evaluate(model, loader_val, device)
-    yt, st = evaluate(model, loader_test, device)
+        with open(os.path.join(out_dir, "train_log.jsonl"), "a") as f:
+            f.write(json.dumps(row) + "\n")
 
-    plot_curves(yv if yv.size else np.array([], int), sv if yv.size else np.array([], float), out_dir, f"{CFG.SAVE_PREFIX}_val")
-    plot_curves(yt if yt.size else np.array([], int), st if yt.size else np.array([], float), out_dir, f"{CFG.SAVE_PREFIX}_test")
-
-    df_val_out = ds_val.df.copy()
-    df_test_out = ds_test.df.copy()
-    if yv.size:
-        df_val_out["score"] = sv
-    else:
-        df_val_out["score"] = np.zeros(len(df_val_out), np.float32)
-    if yt.size:
-        df_test_out["score"] = st
-    else:
-        df_test_out["score"] = np.zeros(len(df_test_out), np.float32)
-
-    df_val_out.to_csv(os.path.join(out_dir, "scores_val.csv"), index=False)
-    df_test_out.to_csv(os.path.join(out_dir, "scores_test.csv"), index=False)
-
-    # Threshold para steps FREEZE e EXPORT no run.py
-    thr = pick_threshold_target_far(yv if yv.size else np.array([0, 1]), sv if yv.size else np.array([0.0, 1.0]), far=CFG.TARGET_FAR)
-    with open(os.path.join(out_dir, "thresholds.json"), "w") as f:
-        json.dump({
-            "mode_used": "target_far",
-            "chosen_threshold": float(thr),
-            "target_far": float(CFG.TARGET_FAR),
-            "notes": "threshold calculado no VAL",
-        }, f, indent=2)
-
-    # Summary
-    try:
-        val_auc = roc_auc_score(yv.astype(int), sv) if yv.size and len(np.unique(yv)) > 1 else None
-        val_ap = average_precision_score(yv.astype(int), sv) if yv.size and len(np.unique(yv)) > 1 else None
-    except Exception:
-        val_auc, val_ap = None, None
-    try:
-        test_auc = roc_auc_score(yt.astype(int), st) if yt.size and len(np.unique(yt)) > 1 else None
-        test_ap = average_precision_score(yt.astype(int), st) if yt.size and len(np.unique(yt)) > 1 else None
-    except Exception:
-        test_auc, test_ap = None, None
-
+    # resumo final
+    summary = {
+        "best_val_ap": float(best_ap),
+        "best_val_auc": float(best_auc),
+        "best_ap_path": best_ap_path if best_ap >= 0 else None,
+        "best_auc_path": best_auc_path if best_auc >= 0 else None,
+        "hparams": asdict(hp)
+    }
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
-        json.dump({
-            "cfg": asdict(CFG),
-            "val": {"auc": val_auc, "ap": val_ap},
-            "test": {"auc": test_auc, "ap": test_ap},
-            "out_dir": out_dir,
-        }, f, indent=2)
+        json.dump(summary, f, indent=2)
 
-    print(f"[OK] MF Stage 2 concluído. Saída: {out_dir}")
+    print("[MF] treino concluído.")
+    print(" Saída:", out_dir)
+    print(" Best@AP:", summary["best_ap_path"])
+    print(" Best@AUC:", summary["best_auc_path"])
+    return summary
 
 
 if __name__ == "__main__":
-    run_mf_stage2()
+    warnings.filterwarnings("ignore", category=UserWarning)
+    train()

@@ -6,9 +6,11 @@
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
-import os, sys, time, glob, shutil, re, logging, json
+import os, sys, time, glob, shutil, re, logging, json, traceback, random
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse
+from dataclasses import dataclass
+from time import perf_counter
 
 import requests
 from tqdm import tqdm
@@ -39,7 +41,7 @@ from viz import ligo_overlay as viz_overlay
 # TOGGLES - ligue ou desligue estágios
 # ============================================================
 ENABLE_DOWNLOAD      = False   # baixa GWOSC
-ENABLE_WHITEN        = False   # pré-processa arquivos novos
+ENABLE_WHITEN        = True   # pré-processa arquivos novos
 ENABLE_WINDOWS       = True    # gera janelas para arquivos novos
 ENABLE_DATASET       = True    # recria dataset.parquet
 ENABLE_BASELINE_ML   = True    # roda baseline_ml.py
@@ -51,6 +53,14 @@ ENABLE_POST_MF2_FREEZE    = True   # passo 1: congelar artefatos
 ENABLE_POST_MF2_EXPORT    = True   # passo 2: exportar candidatos
 ENABLE_POST_MF2_COINC     = True   # passo 3: coincidencia + FAR time slides
 ENABLE_POST_MF2_CALIBRATE = True   # passo 4: calibracao isotonica
+
+# Pré-flight
+ENABLE_PREFLIGHT        = True   # liga o sanity check antes dos estágios
+PREFLIGHT_FAIL_FAST     = True   # se True, aborta o pipeline em falha crítica
+PREFLIGHT_SAMPLE_VAL    = 64     # janelas para smoke do MF
+PREFLIGHT_MIN_WINDOWS   = 1      # pelo menos 1 arquivo *_windows.hdf5
+PREFLIGHT_MIN_WHITENED  = 1      # pelo menos 1 arquivo *_whitened.hdf5
+PREFLIGHT_MIN_DISK_GB   = 3      # espaço livre minimo em GB
 
 # PERFIL de download (se ENABLE_DOWNLOAD=True)
 PROFILE = "extended"            # "initial" | "extended" | "full"
@@ -204,6 +214,219 @@ def _summarize_latest_mf(logger):
 def _latest_mf2_run_dir() -> Optional[str]:
     root = os.path.join(REPORTS_DIR, "mf_stage2")
     return _latest_subdir(root)
+
+# ============================================================
+# PRÉ-FLIGHT: smoke tests estruturais e funcionais
+# ============================================================
+@dataclass
+class TestResult:
+    name: str
+    ok: bool
+    duration_s: float
+    detail: str = ""
+    critical: bool = True
+
+def _human_gb(bytes_val: int) -> str:
+    return f"{bytes_val/(1024**3):.2f} GB"
+
+def _free_space_bytes(path: str) -> int:
+    total, used, free = shutil.disk_usage(os.path.abspath(path))
+    return free
+
+def preflight(logger) -> List[TestResult]:
+    results: List[TestResult] = []
+
+    def run(name: str, critical: bool, fn):
+        t0 = perf_counter()
+        try:
+            msg = fn()
+            results.append(TestResult(name=name, ok=True, duration_s=perf_counter()-t0, detail=msg or "", critical=critical))
+        except Exception as e:
+            tb = traceback.format_exc(limit=2)
+            results.append(TestResult(name=name, ok=False, duration_s=perf_counter()-t0, detail=f"{type(e).__name__}: {e}\n{tb}", critical=critical))
+
+    # 0) Disco e escrita
+    def test_disk():
+        free_root = _free_space_bytes(ROOT)
+        if free_root < PREFLIGHT_MIN_DISK_GB*(1024**3):
+            raise RuntimeError(f"Espaço livre insuficiente: {_human_gb(free_root)}")
+        for d in (LOG_DIR, REPORTS_DIR):
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write_probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        return f"Livre={_human_gb(free_root)} escrita=ok"
+    run("disk_write_space", True, test_disk)
+
+    # 1) Imports essenciais
+    def test_imports():
+        import numpy, scipy, pandas, sklearn, pycbc  # noqa
+        return "numpy, scipy, pandas, sklearn, pycbc importados"
+    run("imports_core_libs", True, test_imports)
+
+    # 2) Dados básicos presentes
+    def test_min_files():
+        wht = _list_files(os.path.join(DATA_INTERIM, "*_whitened.hdf5"))
+        win = _list_files(os.path.join(DATA_PROCESSED, "*_windows.hdf5"))
+        if len(wht) < PREFLIGHT_MIN_WHITENED:
+            raise RuntimeError(f"Sem arquivos whitened suficientes em {DATA_INTERIM}")
+        if len(win) < PREFLIGHT_MIN_WINDOWS:
+            raise RuntimeError(f"Sem arquivos windows suficientes em {DATA_PROCESSED}")
+        return f"whitened={len(wht)} windows={len(win)}"
+    run("data_files_presence", True, test_min_files)
+
+    # 3) Dataset.parquet sanidade
+    def test_dataset_parquet():
+        p = os.path.join(DATA_PROCESSED, "dataset.parquet")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"dataset.parquet ausente em {DATA_PROCESSED}")
+        df = pd.read_parquet(p)
+        cols_ok = {"file_id","start_gps","label"}
+        if "subset" not in df.columns and "split" in df.columns:
+            df = df.rename(columns={"split":"subset"})
+        if "subset" not in df.columns:
+            raise KeyError("dataset.parquet sem coluna subset")
+        miss = cols_ok - set(df.columns)
+        if miss:
+            raise KeyError(f"colunas ausentes: {sorted(miss)}")
+        if df["label"].isna().any():
+            raise ValueError("labels com NaN")
+        labs = set(int(x) for x in df["label"].unique())
+        if not labs.issubset({0,1}):
+            raise ValueError(f"labels fora de {0,1}: {labs}")
+        subs = set(df["subset"].astype(str).unique())
+        if not {"val","test"}.intersection(subs):
+            raise ValueError("subset sem val ou test")
+        return f"rows={len(df)} subsets={sorted(subs)}"
+    run("dataset_structure", True, test_dataset_parquet)
+
+    # 4) Leitura de janela + map para whitened via meta
+    def test_window_slice():
+        idx = mbf.build_windows_index(DATA_PROCESSED)
+        if not idx:
+            raise RuntimeError("index de windows vazio")
+        any_fid, any_win = next(iter(idx.items()))
+        sgps, _, meta_in = mbf.cached_start_arrays(any_win)
+        if len(sgps) == 0:
+            raise RuntimeError("start_gps vazio neste windows")
+        wht = mbf.resolve_whitened_path(any_win, meta_in)
+        if not wht or not os.path.exists(wht):
+            raise RuntimeError("whitened correspondente não encontrado")
+        x = mbf.load_window_slice(any_win, wht, float(sgps[min(3, len(sgps)-1)]))
+        if x is None or not np.isfinite(x).all():
+            raise RuntimeError("janela inválida ou com NaN")
+        return f"window_len={len(x)} file_id={any_fid}"
+    run("window_read", True, test_window_slice)
+
+    # 5) PyCBC gera waveform
+    def test_pycbc_waveform():
+        from pycbc.waveform import get_td_waveform
+        hp, _ = get_td_waveform(approximant="IMRPhenomD", mass1=10, mass2=10, delta_t=1.0/4096, f_lower=20.0)
+        arr = hp.numpy()
+        if arr.size == 0 or not np.isfinite(arr).any():
+            raise RuntimeError("waveform vazio")
+        return f"waveform_len={arr.size}"
+    run("pycbc_waveform", True, test_pycbc_waveform)
+
+    # 6) Smoke do MF em CPU com amostra pequena
+    def test_mf_smoke():
+        p = os.path.join(DATA_PROCESSED, "dataset.parquet")
+        df = pd.read_parquet(p)
+        if "subset" not in df.columns and "split" in df.columns:
+            df = df.rename(columns={"split":"subset"})
+        df = df[["subset","file_id","start_gps","label"]]
+
+        df_sub = pd.DataFrame()
+        for split in ("val","test"):
+            take = df[df["subset"]==split].head(PREFLIGHT_SAMPLE_VAL).copy()
+            if len(take) >= max(8, min(PREFLIGHT_SAMPLE_VAL, 32)):
+                df_sub = take
+                break
+        if df_sub.empty:
+            raise RuntimeError("sem linhas suficientes para smoke MF")
+
+        idx_map = mbf.build_windows_index(DATA_PROCESSED)
+        df_sub = df_sub[df_sub["file_id"].astype(str).isin(idx_map.keys())].reset_index(drop=True)
+        if df_sub.empty:
+            raise RuntimeError("file_ids do dataset não batem com *_windows.hdf5")
+
+        smoke_dir = os.path.join(REPORTS_DIR, "mf_baseline_smoke")
+        os.makedirs(smoke_dir, exist_ok=True)
+
+        with mbf.patch_cfg(
+            USE_GPU=False,
+            USE_NATIVE_NCC=False,
+            MAX_SHIFT_SEC=0.010,
+            LAG_STEP=8,
+            TEMPLATES_N=16,
+            TEMPLATE_SUBSAMPLE=4,
+            PRESELECT_ENABLE=False,
+            TOPK_POOL=1,
+            OUT_DIR_ROOT=smoke_dir,
+            MAX_VAL_ROWS=None,
+            MAX_TEST_ROWS=None,
+            NO_ABORT=True
+        ):
+            bank  = mbf.build_template_bank(mbf.CFG.TEMPLATES_N)
+            cache = mbf.maybe_load_template_cache(smoke_dir, bank, cache_name="__smoke_cache.npz")
+            scores = mbf.score_subset("SMOKE", df_sub, idx_map, cache)
+            if not np.isfinite(scores).all():
+                raise RuntimeError("scores do MF com NaN ou inf")
+            smax = float(np.max(scores)) if scores.size else 0.0
+            return f"rows={len(df_sub)} templates={len(cache)} smax={smax:.4f}"
+    run("mf_smoke_cpu", True, test_mf_smoke)
+
+    # 7) ML baseline: sanidade estrutural e callable
+    def test_ml_presence():
+        if not hasattr(bml, "main") or not callable(bml.main):
+            raise RuntimeError("baseline_ml sem função main()")
+        p = os.path.join(DATA_PROCESSED, "dataset.parquet")
+        df = pd.read_parquet(p)
+        if "subset" not in df.columns and "split" in df.columns:
+            df = df.rename(columns={"split":"subset"})
+        has_train = (df["subset"].astype(str)=="train").any()
+        has_val   = (df["subset"].astype(str)=="val").any()
+        if not (has_train or has_val):
+            raise RuntimeError("dataset sem train ou val para ML")
+        return "baseline_ml import ok e dataset com train ou val"
+    run("ml_presence_struct", True, test_ml_presence)
+
+    # 8) MF2 presença opcional
+    def test_mf2_presence():
+        try:
+            from training.train_mf import run_mf_stage2  # noqa
+        except Exception as e:
+            return f"MF2 opcional ausente: {e}"
+        return "training.train_mf.run_mf_stage2 disponível"
+    run("mf2_presence", False, test_mf2_presence)
+
+    # 9) CuPy opcional
+    def test_gpu_optional():
+        try:
+            import cupy as cp  # noqa
+            _ = cp.cuda.runtime.getDeviceCount()
+            return "CuPy disponível"
+        except Exception as e:
+            return f"CuPy indisponível: {e}"
+    run("gpu_optional_cupy", False, test_gpu_optional)
+
+    # Log resumido
+    ok_all = True
+    logging.getLogger("pipeline").info("=============== PREFLIGHT ===============")
+    for r in results:
+        status = "OK" if r.ok else "FAIL"
+        crit   = "critico" if r.critical else "opcional"
+        logging.getLogger("pipeline").info(f"[{status}] {r.name} ({crit}) em {r.duration_s:.2f}s - {r.detail}")
+        if r.critical and not r.ok:
+            ok_all = False
+    logging.getLogger("pipeline").info("=========================================")
+
+    if PREFLIGHT_FAIL_FAST and not ok_all:
+        raise SystemExit("Pré-flight falhou em teste crítico. Abortado.")
+
+    logging.getLogger("pipeline").info(f"[PREFLIGHT] ok={sum(r.ok for r in results)}/{len(results)}")
+    return results
 
 # ============================================================
 # API v2: eventos
@@ -632,6 +855,18 @@ def main():
     )
     logger.info(f"Profile={PROFILE} | RAW={DATA_RAW} | INTERIM={DATA_INTERIM} | PROCESSED={DATA_PROCESSED}")
     logger.info("=============================================")
+
+    # PREFLIGHT
+    if ENABLE_PREFLIGHT:
+        try:
+            preflight(logger)
+        except SystemExit:
+            logger.error("Pré-flight detectou problemas críticos. Corrija e rode novamente.")
+            return
+        except Exception as e:
+            logger.error(f"Pré-flight falhou de modo inesperado: {e}")
+            if PREFLIGHT_FAIL_FAST:
+                return
 
     t_all = _timer()
 

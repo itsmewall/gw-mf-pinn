@@ -71,7 +71,7 @@ CMAKE_PROJECT_DESCRIPTION:STATIC=
 CMAKE_PROJECT_HOMEPAGE_URL:STATIC=
 
 //Value Computed by CMake
-CMAKE_PROJECT_NAME:STATIC=gwphys
+CMAKE_PROJECT_NAME:STATIC=gwphys_cuda
 
 //Path to a program.
 CMAKE_RANLIB:FILEPATH=/usr/bin/ranlib
@@ -86,13 +86,13 @@ CMAKE_STRIP:FILEPATH=/usr/bin/strip
 CMAKE_TAPI:FILEPATH=CMAKE_TAPI-NOTFOUND
 
 //Value Computed by CMake
-gwphys_BINARY_DIR:STATIC=/home/wallace/gw-mf-pinn/build
+gwphys_cuda_BINARY_DIR:STATIC=/home/wallace/gw-mf-pinn/build
 
 //Value Computed by CMake
-gwphys_IS_TOP_LEVEL:STATIC=ON
+gwphys_cuda_IS_TOP_LEVEL:STATIC=ON
 
 //Value Computed by CMake
-gwphys_SOURCE_DIR:STATIC=/home/wallace/gw-mf-pinn/src/physics
+gwphys_cuda_SOURCE_DIR:STATIC=/home/wallace/gw-mf-pinn/src/physics
 
 
 ########################

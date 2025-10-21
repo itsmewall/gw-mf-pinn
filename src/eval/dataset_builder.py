@@ -3,15 +3,15 @@
 Gera dataset rotulado a partir de *_windows.hdf5.
 
 Pipeline:
-1) Lê data/processed/*_windows.hdf5 (metadados + índices de janelas)
-2) Busca mapa {EVENTO -> tc_gps} no GWOSC API v2 (com cache local)
+1) Lê data/processed/*_windows.hdf5 (metadados e índices de janelas)
+2) Busca mapa {EVENTO -> tc_gps} no GWOSC API v2 com cache local
 3) Rotula janela como label=1 se [start_gps, end_gps] intersecta [tc - pre, tc + pos]
-   - Se existir event_hint (ex.: "GW150914"), usa diretamente esse evento.
-   - Senão, faz matching POR ARQUIVO: pega todos os t_c que caem no range GPS
-     coberto pelo arquivo e marca as janelas que intersectam cada t_c.
-4) Faz split por GRUPO (evento quando houver hint, senão file_id) em train/val/test
-   para evitar leakage entre subsets.
-5) Salva Parquet otimizado + CSV preview + meta.json.
+   - Se existir event_hint (ex.: "GW150914"), usa diretamente esse evento
+   - Senão, faz matching por arquivo: pega todos os t_c que caem no range GPS
+     coberto pelo arquivo e marca as janelas que intersectam cada t_c
+4) Faz split por grupo (evento quando houver hint, senão file_id) em train val test
+   para evitar leakage entre subsets
+5) Salva Parquet otimizado em row groups, CSV preview e meta.json
 
 Requisitos:
   pip install pandas numpy h5py requests scikit-learn pyarrow tqdm
@@ -46,26 +46,25 @@ class Cfg:
     META_JSON: str = os.path.join("data", "processed", "dataset_meta.json")
 
     # Margem temporal ao redor do tc para considerar uma janela positiva
-    T_MARGIN_PRE: float = 2.0
-    T_MARGIN_POS: float = 2.0
+    T_MARGIN_PRE: float = float(os.getenv("DB_T_MARGIN_PRE", 2.0))
+    T_MARGIN_POS: float = float(os.getenv("DB_T_MARGIN_POS", 2.0))
 
-    # Splits (por grupo: evento ou arquivo)
-    TEST_SIZE: float = 0.15
-    VAL_SIZE: float = 0.15  # do restante após remover TEST
+    # Splits por grupo
+    TEST_SIZE: float = float(os.getenv("DB_TEST_SIZE", 0.15))
+    VAL_SIZE: float = float(os.getenv("DB_VAL_SIZE", 0.15))  # do restante após remover TEST
 
-    # Cache (event-versions -> tc)
+    # Cache do mapa evento->tc
     EV2TC_CACHE: str = os.path.join("data", "processed", "_cache_ev2tc.json")
-    EV2TC_TTL_DAYS: int = 7
+    EV2TC_TTL_DAYS: int = int(os.getenv("DB_EV2TC_TTL_DAYS", 7))
 
     # Escrita Parquet
-    PARQUET_ROWGROUP_SIZE: int = 250_000
-    PARQUET_COMPRESSION: str = "zstd"
+    PARQUET_ROWGROUP_SIZE: int = int(os.getenv("DB_ROWGROUP", 250_000))
+    PARQUET_COMPRESSION: str = os.getenv("DB_PARQUET_CODEC", "zstd")
 
     # Sanidade
-    MAX_WINDOWS_PER_FILE_WARN: int = 2_000_000
+    MAX_WINDOWS_PER_FILE_WARN: int = int(os.getenv("DB_MAX_WIN_PER_FILE_WARN", 2_000_000))
 
 CFG = Cfg()
-
 GWOSC = "https://gwosc.org"
 
 # =========================
@@ -99,13 +98,14 @@ def http_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries, pool_connections=8, pool_maxsize=8)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    s.headers.update({"User-Agent": "gw-mf-pinn-dataset-builder/1.0"})
+    s.headers.update({"User-Agent": "gw-mf-pinn-dataset-builder/1.1"})
     return s
 
 # =========================
 # Utils
 # =========================
 _EVENT_RE = re.compile(r"(GW\d{6,})", re.IGNORECASE)
+# Espera padrão tipo H-H1_..., L-L1_..., V-V1_...
 _DET_RE = re.compile(r"^[A-Z]-([HLV]1)_", re.IGNORECASE)
 
 def _infer_event_name_from_source(source_file: str) -> str:
@@ -131,19 +131,23 @@ def _is_cache_fresh(path: str, ttl_days: int) -> bool:
         return False
 
 # =========================
-# Buscar tc no GWOSC API v2 (com cache)
+# Buscar tc no GWOSC API v2 com cache e índice ordenado
 # =========================
-def fetch_event_coalescence_map() -> Dict[str, float]:
+def fetch_event_coalescence_map() -> Tuple[Dict[str, float], np.ndarray]:
     """
-    Retorna {EVENTO: gps_coalescencia} usando a API v2:
+    Retorna:
+      ev2tc: {EVENTO: gps_coalescencia}
+      tc_sorted: array de todos os gps ordenados para busca binária
+    API v2:
       GET /api/v2/event-versions?lastver=true&pagesize=200
-    Pagina até acabar. Campo 'gps' já vem na lista.
     """
     if _is_cache_fresh(CFG.EV2TC_CACHE, CFG.EV2TC_TTL_DAYS):
         try:
             with open(CFG.EV2TC_CACHE, "r", encoding="utf-8") as f:
                 payload = json.load(f)
-            return {k.upper(): float(v) for k, v in payload.get("map", {}).items()}
+            ev2tc = {k.upper(): float(v) for k, v in payload.get("map", {}).items()}
+            tc_sorted = np.sort(np.array(list(ev2tc.values()), dtype=np.float64))
+            return ev2tc, tc_sorted
         except Exception:
             pass
 
@@ -155,13 +159,11 @@ def fetch_event_coalescence_map() -> Dict[str, float]:
         r = sess.get(url, timeout=30)
         r.raise_for_status()
         page = r.json()
-
         for item in page.get("results", []):
             name = item.get("name") or item.get("shortName")
-            gps  = item.get("gps")
+            gps = item.get("gps")
             if name is not None and gps is not None:
                 ev2tc[str(name).upper()] = float(gps)
-
         url = page.get("next") or None
 
     # cache
@@ -173,7 +175,18 @@ def fetch_event_coalescence_map() -> Dict[str, float]:
     except Exception as e:
         log.warning(f"Falha ao salvar cache: {e}")
 
-    return ev2tc
+    tc_sorted = np.sort(np.array(list(ev2tc.values()), dtype=np.float64))
+    return ev2tc, tc_sorted
+
+def tcs_in_range(tc_sorted: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Retorna fatia de t_c que caem no intervalo [lo, hi] usando busca binária."""
+    if tc_sorted.size == 0:
+        return tc_sorted
+    i0 = int(np.searchsorted(tc_sorted, lo, side="left"))
+    i1 = int(np.searchsorted(tc_sorted, hi, side="right"))
+    if i0 >= i1:
+        return tc_sorted[:0]
+    return tc_sorted[i0:i1]
 
 # =========================
 # Leitura de um *_windows.hdf5
@@ -192,18 +205,28 @@ def load_windows_h5(path: str) -> pd.DataFrame:
         stride_sec = float(attrs.get("stride_sec", 0.5))
         source_file = str(attrs.get("source_file", os.path.basename(path)))
 
-        g = f["windows"]
-        start_idx = g["start_idx"][()]
-        start_gps = g["start_gps"][()]
-        snr_rms   = g["snr_rms"][()]
-        snr_peak  = g["snr_peak"][()]
+        if "windows" not in f:
+            raise KeyError("Grupo 'windows' ausente")
 
-    n = len(start_idx)
+        g = f["windows"]
+        # Campos obrigatórios
+        start_idx = np.array(g.get("start_idx", []))
+        start_gps = np.array(g.get("start_gps", []))
+        # Campos opcionais com fallback
+        snr_rms = np.array(g.get("snr_rms", np.zeros_like(start_idx, dtype=np.float32)))
+        snr_peak = np.array(g.get("snr_peak", np.zeros_like(start_idx, dtype=np.float32)))
+
+    n = int(len(start_idx))
+    if n != len(start_gps):
+        raise ValueError("start_idx e start_gps com comprimentos diferentes")
     if n > CFG.MAX_WINDOWS_PER_FILE_WARN:
         log.warning(f"{os.path.basename(path)} tem {n} janelas (> {CFG.MAX_WINDOWS_PER_FILE_WARN}). Revise parâmetros.")
 
-    end_gps = start_gps + window_sec
-    crest = np.maximum(snr_peak / np.maximum(snr_rms, 1e-12), 0.0).astype(np.float32)
+    end_gps = start_gps.astype(np.float64) + float(window_sec)
+
+    # crest_factor robusto contra divisões por zero
+    snr_rms_safe = np.where(np.abs(snr_rms) < 1e-12, 1e-12, snr_rms).astype(np.float32, copy=False)
+    crest = np.clip((snr_peak.astype(np.float32) / snr_rms_safe), a_min=0.0, a_max=None)
 
     det = _infer_detector_from_source(source_file)
     ev_hint = _infer_event_name_from_source(source_file)
@@ -221,21 +244,21 @@ def load_windows_h5(path: str) -> pd.DataFrame:
         "end_gps":   end_gps.astype(np.float64, copy=False),
         "snr_rms":   snr_rms.astype(np.float32, copy=False),
         "snr_peak":  snr_peak.astype(np.float32, copy=False),
-        "crest_factor": crest
+        "crest_factor": crest.astype(np.float32, copy=False)
     })
     return df
 
 # =========================
 # Rotulagem
 # =========================
-def label_windows(df: pd.DataFrame, ev2tc: Dict[str, float],
+def label_windows(df: pd.DataFrame, ev2tc: Dict[str, float], tc_sorted: np.ndarray,
                   t_margin_pre: float, t_margin_pos: float) -> pd.DataFrame:
     """
     label=1 se [start_gps, end_gps] intersecta [tc - pre, tc + pos].
-    1) Se houver event_hint e tc estiver em ev2tc, usa diretamente.
-    2) Para linhas sem hint/sem tc, faz matching POR ARQUIVO (file_id):
+    1) Se houver event_hint e tc estiver em ev2tc, usa diretamente
+    2) Para linhas sem hint ou sem tc, matching por arquivo:
        - calcula [min(start_gps) - pre, max(end_gps) + pos] daquele arquivo
-       - pega TODOS os tc que caem nesse intervalo
+       - pega todos os tc que caem nesse intervalo via busca binária
        - marca janelas que intersectam cada tc candidato
     """
     df = df.copy()
@@ -248,27 +271,26 @@ def label_windows(df: pd.DataFrame, ev2tc: Dict[str, float],
             tc = ev2tc.get(ev.upper())
             if tc is None:
                 continue
-            lo, hi = tc - t_margin_pre, tc + t_margin_pos
+            lo, hi = float(tc - t_margin_pre), float(tc + t_margin_pos)
             hit = (sub["end_gps"].to_numpy() >= lo) & (sub["start_gps"].to_numpy() <= hi)
             df.loc[sub.index[hit], "label"] = 1
 
-    # 2) por arquivo (fallback robusto)
+    # 2) por arquivo
     mask_unlabeled = df["label"].eq(0)
-    if mask_unlabeled.any():
+    if mask_unlabeled.any() and tc_sorted.size > 0:
         for fid, sub in df[mask_unlabeled].groupby("file_id"):
             sg_min = float(sub["start_gps"].min())
             eg_max = float(sub["end_gps"].max())
             lo_all = sg_min - t_margin_pre
             hi_all = eg_max + t_margin_pos
-            # todos os tc que caem dentro do range do arquivo
-            tcs = [tc for tc in ev2tc.values() if lo_all <= tc <= hi_all]
-            if not tcs:
+            tcs = tcs_in_range(tc_sorted, lo_all, hi_all)
+            if tcs.size == 0:
                 continue
             starts = sub["start_gps"].to_numpy()
             ends   = sub["end_gps"].to_numpy()
             indices = sub.index.to_numpy()
             for tc in tcs:
-                lo, hi = tc - t_margin_pre, tc + t_margin_pos
+                lo, hi = float(tc - t_margin_pre), float(tc + t_margin_pos)
                 hit = (ends >= lo) & (starts <= hi)
                 if hit.any():
                     df.loc[indices[hit], "label"] = 1
@@ -276,13 +298,12 @@ def label_windows(df: pd.DataFrame, ev2tc: Dict[str, float],
     return df
 
 # =========================
-# Split por grupo (evento ou arquivo) -> coluna 'subset'
+# Split por grupo -> coluna 'subset'
 # =========================
 def make_group_splits(df: pd.DataFrame,
                       test_size: float, val_size: float,
                       seed: int = 42) -> pd.DataFrame:
     df = df.copy()
-    # grupo é o evento quando há hint; senão file_id
     df["group_id"] = df["event_hint"].where(df["event_hint"].ne(""), df["file_id"]).astype("category")
 
     def _split_by_group(idx_all, groups_all, test_size, seed):
@@ -293,30 +314,33 @@ def make_group_splits(df: pd.DataFrame,
     idx_all = np.arange(len(df))
     groups_all = df["group_id"].astype(str).to_numpy()
 
-    # 1) TEST
+    # TEST
     trv_idx, te_idx = _split_by_group(idx_all, groups_all, test_size, seed)
     train_val = df.iloc[trv_idx].copy()
-    test = df.iloc[te_idx].copy(); test["subset"] = "test"
+    test = df.iloc[te_idx].copy()
+    test["subset"] = "test"
 
-    # 2) VAL do restante
-    rel_val = val_size / (1.0 - test_size + 1e-12)
+    # VAL do restante
+    rel_val = val_size / max(1e-12, (1.0 - test_size))
     idx_trv = np.arange(len(train_val))
     groups_trv = train_val["group_id"].astype(str).to_numpy()
     tr_idx, va_idx = _split_by_group(idx_trv, groups_trv, rel_val, seed + 1)
-    train = train_val.iloc[tr_idx].copy(); train["subset"] = "train"
-    val   = train_val.iloc[va_idx].copy(); val["subset"]   = "val"
+    train = train_val.iloc[tr_idx].copy()
+    val   = train_val.iloc[va_idx].copy()
+    train["subset"] = "train"
+    val["subset"]   = "val"
 
     out = pd.concat([train, val, test], ignore_index=True)
-    out["subset"] = out["subset"].astype("category")
+    out["subset"] = pd.Categorical(out["subset"], categories=["train", "val", "test"])
 
     # log distribuição
     for tag, part in (("TRAIN", train), ("VAL", val), ("TEST", test)):
         posp = 100.0 * float(part["label"].sum()) / max(len(part), 1)
-        log.info(f"{tag}: n={len(part):,} | pos%={posp:.2f}")
+        log.info(f"{tag}: n={len(part):,} pos%={posp:.2f}")
     return out.drop(columns=["group_id"])
 
 # =========================
-# Escrita Parquet
+# Escrita Parquet em row groups
 # =========================
 def write_parquet(df: pd.DataFrame, out_path: str, compression: str, rowgroup_size: int) -> None:
     import pyarrow as pa
@@ -335,17 +359,21 @@ def write_parquet(df: pd.DataFrame, out_path: str, compression: str, rowgroup_si
         if col in df:
             df[col] = df[col].astype(np.float32)
 
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    pq.write_table(
-        table, out_path,
+    # Schema fixo para não oscilar entre row groups
+    schema = pa.Table.from_pandas(df.head(0), preserve_index=False).schema
+    writer = pq.ParquetWriter(
+        out_path, schema,
         compression=compression,
         version="2.6",
-        use_dictionary=True,
-        data_page_size=None,
-        write_statistics=True
-        # Nota: rowgroup_size não é parâmetro direto do write_table; se quiser
-        # controlar, use um writer explícito com chunks. Para simplicidade, omitimos.
+        use_dictionary=True
     )
+    try:
+        for start in range(0, len(df), max(1, rowgroup_size)):
+            chunk = df.iloc[start:start + rowgroup_size]
+            table = pa.Table.from_pandas(chunk, preserve_index=False, schema=schema)
+            writer.write_table(table)
+    finally:
+        writer.close()
     log.info(f"Parquet escrito: {out_path} (linhas: {len(df):,})")
 
 # =========================
@@ -357,21 +385,21 @@ def main():
     # 1) localizar janelas
     paths = sorted(glob.glob(os.path.join(CFG.PROCESSED_DIR, "*_windows.hdf5")))
     if not paths:
-        log.error("Nenhum *_windows.hdf5 em data/processed/. Rode seu run_gwosc.py com ENABLE_WINDOWS=True.")
+        log.error("Nenhum *_windows.hdf5 em data/processed. Rode o gerador de janelas antes.")
         return
     log.info(f"Arquivos de janelas encontrados: {len(paths)}")
 
-    # 2) mapa de t_c (com cache)
-    ev2tc = fetch_event_coalescence_map()
+    # 2) mapa de t_c com cache
+    ev2tc, tc_sorted = fetch_event_coalescence_map()
     log.info(f"Eventos com tc disponíveis: {len(ev2tc)}")
 
-    # 3) ler + rotular por arquivo
+    # 3) ler e rotular por arquivo
     frames: List[pd.DataFrame] = []
-    for p in tqdm(paths, desc="Lendo/rotulando", unit="file"):
+    for p in tqdm(paths, desc="Lendo e rotulando", unit="file"):
         try:
             df_file = load_windows_h5(p)
             df_file = label_windows(
-                df_file, ev2tc,
+                df_file, ev2tc, tc_sorted,
                 t_margin_pre=CFG.T_MARGIN_PRE,
                 t_margin_pos=CFG.T_MARGIN_POS
             )
@@ -380,12 +408,12 @@ def main():
             log.error(f"Falha em {os.path.basename(p)}: {e}")
 
     if not frames:
-        log.error("Nenhum dado válido após leitura/rotulagem.")
+        log.error("Nenhum dado válido após leitura e rotulagem.")
         return
 
     df_all = pd.concat(frames, ignore_index=True)
 
-    # 4) splits por grupo -> coluna 'subset'
+    # 4) splits por grupo -> coluna subset
     df_all = make_group_splits(
         df_all,
         test_size=CFG.TEST_SIZE,
@@ -393,7 +421,7 @@ def main():
         seed=42
     )
 
-    # 5) colunas finais (incluir 'subset' para consumo pelo mf_baseline)
+    # 5) colunas finais
     keep_cols = [
         "file_id", "source_file", "event_hint", "detector",
         "fs", "start_gps", "end_gps", "start_idx",
@@ -408,8 +436,11 @@ def main():
     df_all = df_all[keep_cols].copy()
 
     # 6) preview
-    df_all.head(2000).to_csv(CFG.OUT_PREVIEW, index=False)
-    log.info(f"Preview salvo: {CFG.OUT_PREVIEW}")
+    try:
+        df_all.head(2000).to_csv(CFG.OUT_PREVIEW, index=False)
+        log.info(f"Preview salvo: {CFG.OUT_PREVIEW}")
+    except Exception as e:
+        log.warning(f"Falha ao salvar preview: {e}")
 
     # 7) parquet
     write_parquet(
@@ -429,6 +460,14 @@ def main():
         "rowgroup_size": CFG.PARQUET_ROWGROUP_SIZE,
         "n_rows": int(len(df_all)),
         "n_pos": int(df_all["label"].sum()),
+        "by_subset": {
+            k: {
+                "n": int(len(v)),
+                "pos": int(v["label"].sum()),
+                "pos_pct": float(100.0 * v["label"].sum() / max(len(v), 1))
+            }
+            for k, v in df_all.groupby("subset")
+        }
     }
     with open(CFG.META_JSON, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -438,9 +477,9 @@ def main():
     tot = len(df_all)
     pos = int(df_all["label"].sum())
     log.info("===== RESUMO DATASET =====")
-    log.info(f"Linhas totais : {tot:,}")
-    log.info(f"Positivas     : {pos:,}  ({100.0*pos/max(tot,1):.2f}%)")
-    log.info(f"Parquet       : {CFG.OUT_PARQUET}")
+    log.info(f"Linhas totais: {tot:,}")
+    log.info(f"Positivas: {pos:,}  ({100.0*pos/max(tot,1):.2f}%)")
+    log.info(f"Parquet: {CFG.OUT_PARQUET}")
     log.info("===========================")
 
 if __name__ == "__main__":
