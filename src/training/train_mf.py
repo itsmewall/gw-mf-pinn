@@ -1,20 +1,545 @@
-# Shim: adapta src/train/train_mf.train() ao contrato run_mf_stage2()
-import os, json, time, torch
+# src/training/train_mf.py
+# ======================================================================================
+# Treinador Multi-Fidelity (MF1 + MF2) para detecção binária em janelas GW
+# - Sem CLI. Use train(hparams=None) ou run_mf_stage2(out_dir_root=...)
+# - Lê dataset.parquet e *_windows.hdf5
+# - MF1: encoder raso e barato (low-fidelity)
+# - MF2: encoder mais profundo condicionado em MF1
+# - Perdas: BCE + consistência MF1↔MF2 + distil opcional via scores de baseline (csv)
+# - Amp mista, autocast, grad clip, checkpoint best por AP e por AUC
+# - Augment: time-shift, ruído gaussiano, dropout temporal
+# - Pós-treino: run_mf_stage2 exporta scores, thresholds, summary para o pipeline
+# ======================================================================================
+
+from __future__ import annotations
+import os, time, json, math, random, pathlib, warnings
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Tuple, List
+
 import numpy as np
 import pandas as pd
+import h5py
 
-# importa tudo do seu MF2 real
-from train.train_mf import (
-    HParams, MFModel, WindowsDS, build_windows_index, eval_epoch, train as _train
-)
+from fractions import Fraction
+from scipy.signal import resample_poly
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-DATA_PROCESSED = os.path.join(ROOT, "data", "processed")
-REPORTS_ROOT   = os.path.join(ROOT, "reports")
-OUT_ROOT       = os.path.join(REPORTS_ROOT, "mf_stage2")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# =========================
+# Defaults
+# =========================
+@dataclass
+class HParams:
+    # dados
+    PARQUET_PATH: str = os.path.join("data", "processed", "dataset.parquet")
+    WINDOWS_DIR: str  = os.path.join("data", "processed")
+    FS_TARGET: int    = 4096
+    WINDOW_SEC: float = 2.0
+    SUBSETS: Tuple[str, ...] = ("train","val","test")
+
+    # treino
+    EPOCHS: int       = 12
+    BATCH: int        = 128
+    LR: float         = 2e-4
+    WD: float         = 1e-4
+    OPT: str          = "adamw"
+    AMP: bool         = True
+    GRAD_CLIP: float  = 1.0
+    NUM_WORKERS: int  = 4
+    PIN_MEMORY: bool  = True
+    SEED: int         = 2025
+    DEVICE: str       = "cuda"
+
+    # perdas
+    W_BCE: float      = 1.0
+    W_CONSIST: float  = 0.2
+    W_DISTIL: float   = 0.3
+
+    # distil opcional
+    TEACHER_CSV_VAL: Optional[str] = None  # reports/.../scores_val.csv
+    TEACHER_CSV_TST: Optional[str] = None  # reports/.../scores_test.csv
+    TEACHER_COL: str = "score"             # coluna de score do baseline
+
+    # augment
+    AUG_TIMESHIFT_SEC: float = 0.010       # deslocamento aleatório máximo
+    AUG_GAUSS_STD: float    = 0.02         # ruído gaussiano std
+    TIME_DROPOUT_P: float   = 0.03         # zera pontos aleatórios
+
+    # modelo
+    CH_MF1: int       = 32
+    CH_MF2: int       = 48
+    DROPOUT: float    = 0.05
+
+    # saída
+    OUT_DIR: str      = os.path.join("runs", "mf")
+    SAVE_EVERY: int   = 1
+
+
+# =========================
+# Utilidades de dados
+# =========================
+def set_seed(seed: int):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+def _next_pow2(n: int) -> int:
+    return 1 << (int(n - 1).bit_length())
+
+def build_windows_index(windows_dir: str) -> Dict[str, str]:
+    idx: Dict[str, str] = {}
+    for root, _, files in os.walk(windows_dir):
+        for f in files:
+            if f.endswith("_windows.hdf5"):
+                idx[f] = os.path.abspath(os.path.join(root, f))
+    if not idx:
+        raise FileNotFoundError("Nenhum *_windows.hdf5 encontrado")
+    return idx
+
+def _read_attrs(obj) -> Dict[str, float | str]:
+    out = {}
+    try:
+        for k, v in obj.attrs.items():
+            if hasattr(v, "item"):
+                try: v = v.item()
+                except Exception: pass
+            out[str(k)] = v
+    except Exception:
+        pass
+    return out
+
+_cached_sgps: Dict[str, Tuple[np.ndarray, np.ndarray, Dict[str,str]]] = {}
+
+def _cached_start_arrays(win_path: str):
+    if win_path in _cached_sgps:
+        return _cached_sgps[win_path]
+    with h5py.File(win_path, "r") as f:
+        sgps = f["/windows/start_gps"][()].astype(float)
+        sidx = f["/windows/start_idx"][()].astype(int)
+        meta = _read_attrs(f["/meta_in"]) if "/meta_in" in f else {}
+    _cached_sgps[win_path] = (sgps, sidx, meta)
+    return _cached_sgps[win_path]
+
+def _resolve_whitened_path(win_path: str, meta_in: Dict[str,str]) -> Optional[str]:
+    src = meta_in.get("source_path") or meta_in.get("source_file") or meta_in.get("source")
+    candidates = []
+    if src and os.path.isabs(src): candidates.append(src)
+    if src:
+        candidates += [
+            os.path.join(os.path.dirname(win_path), src),
+            os.path.join("data", "interim", os.path.basename(src)),
+            os.path.join("data", "processed", os.path.basename(src)),
+        ]
+    bn = os.path.basename(win_path).replace("_windows.hdf5", "_whitened.hdf5")
+    candidates += [
+        os.path.join(os.path.dirname(win_path), bn),
+        os.path.join("data","interim", bn),
+        os.path.join("data","processed", bn),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c): return os.path.abspath(c)
+    return None
+
+def _load_window_slice(win_path: str, wht_path: str, start_gps: float, fs_tgt: int, win_sec: float) -> Optional[np.ndarray]:
+    try:
+        sgps, sidx, _ = _cached_start_arrays(win_path)
+        idxs = np.where(np.isclose(sgps, float(start_gps), atol=5e-4))[0]
+        if idxs.size == 0: return None
+        i0 = int(sidx[int(idxs[0])])
+
+        with h5py.File(wht_path, "r") as g:
+            cand = ["/strain/StrainWhitened","/strain/whitened","/data/whitened","/whitened","/strain/Strain"]
+            dset = None
+            for c in cand:
+                if c in g and isinstance(g[c], h5py.Dataset):
+                    dset = g[c]; break
+            if dset is None: return None
+            a_g = _read_attrs(g) | _read_attrs(dset)
+            fs_in = a_g.get("fs") or a_g.get("sample_rate")
+            if not fs_in:
+                xs = a_g.get("xspacing") or a_g.get("Xspacing")
+                if not xs: return None
+                fs_in = 1.0/float(xs)
+            fs_in = int(round(float(fs_in)))
+            wlen_in = int(round(win_sec*fs_in))
+            if i0 < 0 or (i0 + wlen_in) > int(dset.shape[0]): return None
+            x = dset[i0:i0+wlen_in].astype(np.float32, copy=True)
+
+        if fs_in != fs_tgt:
+            frac = Fraction(fs_tgt, fs_in).limit_denominator(64)
+            x = resample_poly(x, frac.numerator, frac.denominator).astype(np.float32, copy=False)
+
+        wlen = int(round(win_sec*fs_tgt))
+        if x.size > wlen: x = x[-wlen:]
+        elif x.size < wlen:
+            buf = np.zeros(wlen, np.float32); buf[-x.size:] = x; x = buf
+
+        if not np.any(np.isfinite(x)): return None
+        x -= x.mean()
+        x /= (x.std() + 1e-12)
+        return x
+    except Exception:
+        return None
+
+
+# =========================
+# Dataset
+# =========================
+class WindowsDS(Dataset):
+    def __init__(self,
+                 df: pd.DataFrame,
+                 win_index: Dict[str,str],
+                 fs_tgt: int,
+                 win_sec: float,
+                 teacher_map: Optional[Dict[Tuple[str,float], float]] = None,
+                 aug: bool = False,
+                 time_dropout_p: float = 0.0,
+                 timeshift_sec: float = 0.0,
+                 gauss_std: float = 0.0):
+        self.df = df.reset_index(drop=True).copy()
+        self.idx_map = win_index
+        self.fs = fs_tgt
+        self.sec = win_sec
+        self.teacher = teacher_map or {}
+        self.aug = aug
+        self.tdp = float(time_dropout_p)
+        self.tshift = float(timeshift_sec)
+        self.gstd = float(gauss_std)
+
+        # cache por arquivo
+        self._wht_cache: Dict[str,str] = {}
+
+    def __len__(self): return len(self.df)
+
+    def _get_wht(self, fid: str) -> Optional[str]:
+        if fid in self._wht_cache: return self._wht_cache[fid]
+        p = self.idx_map.get(fid)
+        if not p:
+            self._wht_cache[fid] = None
+            return None
+        _, _, meta = _cached_start_arrays(p)
+        wht = _resolve_whitened_path(p, meta)
+        self._wht_cache[fid] = wht
+        return wht
+
+    def _augment(self, x: np.ndarray) -> np.ndarray:
+        if self.tshift > 0.0:
+            max_shift = int(round(self.tshift * self.fs))
+            if max_shift > 0:
+                k = np.random.randint(-max_shift, max_shift+1)
+                if k != 0:
+                    x = np.roll(x, k)
+        if self.gstd > 0.0:
+            x = x + np.random.normal(0.0, self.gstd, size=x.shape).astype(np.float32)
+        if self.tdp > 0.0:
+            mask = np.random.rand(*x.shape) < self.tdp
+            x = x.copy(); x[mask] = 0.0
+        x = (x - x.mean()) / (x.std() + 1e-12)
+        return x
+
+    def __getitem__(self, i: int):
+        row = self.df.iloc[i]
+        fid  = str(row["file_id"])
+        sgps = float(row["start_gps"])
+        y    = int(row["label"])
+        wht  = self._get_wht(fid)
+        if (not wht) or (not os.path.exists(wht)):
+            L = int(round(self.sec*self.fs))
+            x = np.zeros(L, np.float32)
+        else:
+            win_path = self.idx_map.get(fid)
+            x = _load_window_slice(win_path, wht, sgps, self.fs, self.sec)
+            if x is None:
+                L = int(round(self.sec*self.fs))
+                x = np.zeros(L, np.float32)
+        if self.aug: x = self._augment(x)
+        t = torch.from_numpy(x).float().unsqueeze(0)  # [1, L]
+        teach = float(self.teacher.get((fid, sgps), np.nan))
+        return t, torch.tensor(y, dtype=torch.float32), teach, fid, sgps
+
+
+# =========================
+# Modelo MF
+# =========================
+class ConvBlock(nn.Module):
+    def __init__(self, c_in, c_out, k, s=1, p=None, dropout=0.0):
+        super().__init__()
+        if p is None: p = (k-1)//2
+        self.net = nn.Sequential(
+            nn.Conv1d(c_in, c_out, k, stride=s, padding=p, bias=False),
+            nn.BatchNorm1d(c_out),
+            nn.SiLU(),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x): return self.net(x)
+
+class MFModel(nn.Module):
+    """
+    MF1: leve, gera feature z1 e um logit raso
+    MF2: mais profundo, recebe concat([x, up(z1)]) e gera logit final
+    """
+    def __init__(self, ch_mf1=32, ch_mf2=48, dropout=0.05):
+        super().__init__()
+        # MF1
+        self.mf1 = nn.Sequential(
+            ConvBlock(1, ch_mf1, 9, s=2, dropout=dropout),
+            ConvBlock(ch_mf1, ch_mf1, 7, s=2, dropout=dropout),
+            ConvBlock(ch_mf1, ch_mf1, 5, s=1, dropout=dropout),
+        )
+        self.mf1_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(ch_mf1, 1)
+        )
+        # MF2
+        self.proj_z1 = nn.Conv1d(ch_mf1, 16, kernel_size=1)
+        self.mf2 = nn.Sequential(
+            ConvBlock(1+16, ch_mf2, 9, s=2, dropout=dropout),
+            ConvBlock(ch_mf2, ch_mf2, 7, s=2, dropout=dropout),
+            ConvBlock(ch_mf2, ch_mf2, 5, s=1, dropout=dropout),
+            ConvBlock(ch_mf2, ch_mf2, 3, s=1, dropout=dropout),
+        )
+        self.mf2_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(ch_mf2, 1)
+        )
+
+    def forward(self, x):
+        # x: [B,1,L]
+        z1 = self.mf1(x)                            # [B,C1,L1]
+        y1 = self.mf1_head(z1).squeeze(-1)         # [B]
+        # upsample por repetição para alinhar comprimentos
+        L = x.shape[-1]; L1 = z1.shape[-1]
+        up = F.interpolate(self.proj_z1(z1), size=max(L//4, L1), mode="nearest")
+        if up.shape[-1] != x.shape[-1]:
+            up = F.interpolate(up, size=L, mode="nearest")
+        h2 = self.mf2(torch.cat([x, up], dim=1))   # [B,C2,L2]
+        y2 = self.mf2_head(h2).squeeze(-1)         # [B]
+        return y1, y2, z1, h2
+
+
+# =========================
+# Métricas e loop
+# =========================
+@torch.no_grad()
+def eval_epoch(model, dl, device, amp=True):
+    model.eval()
+    all_y, all_p = [], []
+    for xb, yb, _, _, _ in dl:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+            _, y2, _, _ = model(xb)
+        all_y.append(yb.detach().float().cpu().numpy())
+        all_p.append(torch.sigmoid(y2).detach().float().cpu().numpy())
+    y = np.concatenate(all_y) if all_y else np.zeros(0)
+    p = np.concatenate(all_p) if all_p else np.zeros(0)
+    if len(np.unique(y.astype(int))) >= 2:
+        auc = float(roc_auc_score(y, p))
+        ap  = float(average_precision_score(y, p))
+    else:
+        auc, ap = float("nan"), float("nan")
+    return {"auc": auc, "ap": ap, "n": int(y.size)}
+
+def make_teacher_map(csv_path: Optional[str], key_cols=("file_id","start_gps"), val_col="score"):
+    if not csv_path or not os.path.exists(csv_path): return {}
+    df = pd.read_csv(csv_path)
+    need = set(key_cols) | {val_col}
+    if not need.issubset(df.columns): return {}
+    out = {}
+    for _, r in df.iterrows():
+        fid = str(r[key_cols[0]]); sgps = float(r[key_cols[1]])
+        sc  = float(r[val_col])
+        out[(fid, sgps)] = sc
+    return out
+
+
+def train(hparams: Optional[Dict] = None):
+    hp = HParams()
+    if hparams:
+        for k, v in hparams.items():
+            if hasattr(hp, k): setattr(hp, k, v)
+
+    set_seed(hp.SEED)
+    device = torch.device(hp.DEVICE if torch.cuda.is_available() and hp.DEVICE.startswith("cuda") else "cpu")
+
+    # saída
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    out_dir = os.path.join(hp.OUT_DIR, ts)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # salva config
+    with open(os.path.join(out_dir, "hparams.json"), "w") as f:
+        json.dump(asdict(hp), f, indent=2)
+
+    # carrega dataset
+    df = pd.read_parquet(hp.PARQUET_PATH)
+    split_col = None
+    for c in ("subset","split"):
+        if c in df.columns:
+            split_col = c
+            break
+    if split_col == "split":
+        df = df.rename(columns={"split":"subset"}); split_col = "subset"
+    if split_col is None:
+        raise KeyError("dataset.parquet precisa ter coluna subset|split")
+
+    need_cols = {"file_id","start_gps","label","subset"}
+    if not need_cols.issubset(df.columns):
+        raise KeyError(f"Colunas ausentes no parquet: {need_cols - set(df.columns)}")
+
+    idx_map = build_windows_index(hp.WINDOWS_DIR)
+
+    # teacher maps
+    t_map_val = make_teacher_map(hp.TEACHER_CSV_VAL, val_col=hp.TEACHER_COL)
+    t_map_tst = make_teacher_map(hp.TEACHER_CSV_TST, val_col=hp.TEACHER_COL)
+
+    # splits
+    df_train = df[df["subset"]=="train"].copy()
+    df_val   = df[df["subset"]=="val"].copy()
+    df_test  = df[df["subset"]=="test"].copy()
+
+    ds_tr = WindowsDS(df_train, idx_map, hp.FS_TARGET, hp.WINDOW_SEC,
+                      teacher_map=None, aug=True,
+                      time_dropout_p=hp.TIME_DROPOUT_P,
+                      timeshift_sec=hp.AUG_TIMESHIFT_SEC,
+                      gauss_std=hp.AUG_GAUSS_STD)
+    ds_va = WindowsDS(df_val, idx_map, hp.FS_TARGET, hp.WINDOW_SEC,
+                      teacher_map=t_map_val or None, aug=False)
+    ds_te = WindowsDS(df_test, idx_map, hp.FS_TARGET, hp.WINDOW_SEC,
+                      teacher_map=t_map_tst or None, aug=False)
+
+    dl_tr = DataLoader(ds_tr, batch_size=hp.BATCH, shuffle=True,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY, drop_last=True)
+    dl_va = DataLoader(ds_va, batch_size=max(256, hp.BATCH), shuffle=False,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
+    dl_te = DataLoader(ds_te, batch_size=max(256, hp.BATCH), shuffle=False,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
+
+    # modelo e otimizador
+    model = MFModel(ch_mf1=hp.CH_MF1, ch_mf2=hp.CH_MF2, dropout=hp.DROPOUT).to(device)
+    if hp.OPT.lower() == "adamw":
+        opt = torch.optim.AdamW(model.parameters(), lr=hp.LR, weight_decay=hp.WD, betas=(0.9, 0.999))
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=hp.LR, weight_decay=hp.WD)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(hp.EPOCHS, 1))
+
+    scaler = torch.cuda.amp.GradScaler(enabled=hp.AMP and device.type=="cuda")
+
+    bce = nn.BCEWithLogitsLoss()
+
+    best_ap, best_auc = -1.0, -1.0
+    best_ap_path = os.path.join(out_dir, "model_best_ap.pt")
+    best_auc_path = os.path.join(out_dir, "model_best_auc.pt")
+
+    log_hist = []
+
+    for epoch in range(1, hp.EPOCHS+1):
+        model.train()
+        t0 = time.time()
+        loss_meter = 0.0
+        n_steps = 0
+
+        for xb, yb, tb, _, _ in dl_tr:
+            xb = xb.to(device, non_blocking=True)   # [B,1,L]
+            yb = yb.to(device, non_blocking=True)   # [B]
+            tb = torch.tensor(tb, dtype=torch.float32, device=device)  # [B]
+
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=hp.AMP):
+                y1, y2, z1, h2 = model(xb)
+                loss_bce = bce(y2, yb)
+
+                # consistência MF1 ↔ MF2: aproxima logits
+                loss_consist = F.mse_loss(torch.sigmoid(y1).detach(), torch.sigmoid(y2)) + \
+                               F.mse_loss(torch.sigmoid(y1), torch.sigmoid(y2).detach())
+
+                # distillation opcional se existir teacher em batch
+                has_teacher = torch.isfinite(tb)
+                if has_teacher.any():
+                    tnorm = torch.clamp((tb - 0.0) / 1.0, 0.0, 1.0)
+                    loss_distil = F.mse_loss(torch.sigmoid(y2)[has_teacher], tnorm[has_teacher])
+                else:
+                    loss_distil = torch.tensor(0.0, device=device)
+
+                loss = hp.W_BCE*loss_bce + hp.W_CONSIST*loss_consist + hp.W_DISTIL*loss_distil
+
+            scaler.scale(loss).backward()
+            if hp.GRAD_CLIP and hp.GRAD_CLIP > 0:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), hp.GRAD_CLIP)
+            scaler.step(opt)
+            scaler.update()
+
+            loss_meter += float(loss.detach().cpu().item())
+            n_steps += 1
+
+        sched.step()
+        dt = time.time() - t0
+
+        # avaliação
+        met_val = eval_epoch(model, dl_va, device, amp=hp.AMP)
+        met_tst = eval_epoch(model, dl_te, device, amp=hp.AMP)
+
+        row = {
+            "epoch": epoch,
+            "loss": loss_meter/max(n_steps,1),
+            "lr": float(opt.param_groups[0]["lr"]),
+            "val_auc": met_val["auc"],
+            "val_ap": met_val["ap"],
+            "val_n": met_val["n"],
+            "test_auc": met_tst["auc"],
+            "test_ap": met_tst["ap"],
+            "test_n": met_tst["n"],
+            "time_s": dt
+        }
+        log_hist.append(row)
+        print(f"[MF][{epoch}/{hp.EPOCHS}] loss={row['loss']:.4f} valAUC={row['val_auc']:.4f} valAP={row['val_ap']:.4f} testAUC={row['test_auc']:.4f} testAP={row['test_ap']:.4f} {dt:.1f}s")
+
+        # checkpoints
+        if met_val["ap"] > best_ap:
+            best_ap = met_val["ap"]
+            torch.save({"epoch": epoch, "state_dict": model.state_dict(), "metrics": row}, best_ap_path)
+        if met_val["auc"] > best_auc:
+            best_auc = met_val["auc"]
+            torch.save({"epoch": epoch, "state_dict": model.state_dict(), "metrics": row}, best_auc_path)
+
+        if (epoch % max(1, hp.SAVE_EVERY)) == 0:
+            cur_path = os.path.join(out_dir, f"model_ep{epoch:03d}.pt")
+            torch.save({"epoch": epoch, "state_dict": model.state_dict(), "metrics": row}, cur_path)
+
+        with open(os.path.join(out_dir, "train_log.jsonl"), "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    # resumo final
+    summary = {
+        "best_val_ap": float(best_ap),
+        "best_val_auc": float(best_auc),
+        "best_ap_path": best_ap_path if best_ap >= 0 else None,
+        "best_auc_path": best_auc_path if best_auc >= 0 else None,
+        "hparams": asdict(hp)
+    }
+    with open(os.path.join(out_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("[MF] treino concluído.")
+    print(" Saída:", out_dir)
+    print(" Best@AP:", summary["best_ap_path"])
+    print(" Best@AUC:", summary["best_auc_path"])
+    return summary
+
+
+# =========================
+# Helpers de export e wrapper MF2
+# =========================
 def _ts(): return time.strftime("%Y%m%d-%H%M%S", time.localtime())
-def _ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def _choose_threshold_by_far(labels, scores, target_fpr=1e-4):
     labels = np.asarray(labels).astype(int)
@@ -66,18 +591,24 @@ def _predict_scores(model, dl, device):
     df = pd.DataFrame(rows, columns=["file_id","start_gps","label","score"])
     return df
 
-def run_mf_stage2(config_path: str | None = None):
-    # 1) treina usando seu MF2 real e pega melhor checkpoint
-    sum_train = _train()  # usa defaults do seu HParams
+def run_mf_stage2(out_dir_root: Optional[str] = None):
+    """
+    Treina via train() e exporta scores/thresholds/summary no formato esperado pelo pipeline.
+    """
+    hp = HParams()
+    # 1) Treino
+    sum_train = train()  # usa defaults de HParams, pode ser override via run.py se quiser
     best_path = sum_train.get("best_ap_path") or sum_train.get("best_auc_path")
     if not best_path or not os.path.exists(best_path):
         raise RuntimeError("MF2 treinou, mas não encontrei best_*_path no resumo.")
 
-    # 2) prepara diretório padrão do pipeline
-    out_dir = os.path.join(OUT_ROOT, _ts()); _ensure_dir(out_dir)
+    # 2) Diretório de saída
+    root = out_dir_root or os.path.join("reports", "mf_stage2")
+    os.makedirs(root, exist_ok=True)
+    out_dir = os.path.join(root, _ts())
+    os.makedirs(out_dir, exist_ok=True)
 
-    # 3) carrega dataset e index
-    hp = HParams()
+    # 3) Dados e index
     df = pd.read_parquet(hp.PARQUET_PATH)
     if "subset" not in df.columns and "split" in df.columns:
         df = df.rename(columns={"split":"subset"})
@@ -87,30 +618,30 @@ def run_mf_stage2(config_path: str | None = None):
 
     idx_map = build_windows_index(hp.WINDOWS_DIR)
 
-    # 4) DataLoaders val/test para gerar scores
     df_val  = df[df["subset"]=="val"].copy()
     df_test = df[df["subset"]=="test"].copy()
+
     ds_va = WindowsDS(df_val,  idx_map, hp.FS_TARGET, hp.WINDOW_SEC, teacher_map=None, aug=False)
     ds_te = WindowsDS(df_test, idx_map, hp.FS_TARGET, hp.WINDOW_SEC, teacher_map=None, aug=False)
 
-    dl_va = torch.utils.data.DataLoader(ds_va, batch_size=max(256, hp.BATCH), shuffle=False,
-                                        num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
-    dl_te = torch.utils.data.DataLoader(ds_te, batch_size=max(256, hp.BATCH), shuffle=False,
-                                        num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
+    dl_va = DataLoader(ds_va, batch_size=max(256, hp.BATCH), shuffle=False,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
+    dl_te = DataLoader(ds_te, batch_size=max(256, hp.BATCH), shuffle=False,
+                       num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
 
-    # 5) carrega modelo e checkpoint
+    # 4) Carrega melhor checkpoint
     device = torch.device("cuda" if torch.cuda.is_available() and hp.DEVICE.startswith("cuda") else "cpu")
     model = MFModel(ch_mf1=hp.CH_MF1, ch_mf2=hp.CH_MF2, dropout=hp.DROPOUT).to(device)
     state = torch.load(best_path, map_location=device)
     model.load_state_dict(state["state_dict"], strict=False)
 
-    # 6) gera scores CSVs
+    # 5) Gera scores
     val_csv  = os.path.join(out_dir, "scores_val.csv")
     test_csv = os.path.join(out_dir, "scores_test.csv")
     _predict_scores(model, dl_va, device).to_csv(val_csv, index=False)
     _predict_scores(model, dl_te, device).to_csv(test_csv, index=False)
 
-    # 7) escolhe limiar por FAR alvo e monta summaries
+    # 6) Threshold por FAR alvo e summary
     val_df  = pd.read_csv(val_csv)
     test_df = pd.read_csv(test_csv)
 
@@ -126,10 +657,10 @@ def run_mf_stage2(config_path: str | None = None):
         json.dump({
             "cfg": {"MODE": "constrained_roc", "TARGET_FAR": 1e-4},
             "gpu": {"requested": True, "available": torch.cuda.is_available()},
-            "val": {},  # métricas detalhadas não são obrigatórias aqui
+            "val": {},  # detalhado não obrigatório aqui
             "test": {
                 "auc": None, "ap": None,
-                "confusion_at_thr": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
+                "confusion_at_thr": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
                 "precision": float(prec), "recall": float(rec), "fpr": float(fpr)
             },
             "threshold": thr,
@@ -138,3 +669,8 @@ def run_mf_stage2(config_path: str | None = None):
 
     print(f"[MF2] OK. Saída: {out_dir}")
     return out_dir
+
+
+if __name__ == "__main__":
+    warnings.filterwarnings("ignore", category=UserWarning)
+    run_mf_stage2()
