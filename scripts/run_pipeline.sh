@@ -1,34 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Raiz do projeto é a pasta do script
+# pastas
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 cd "$ROOT_DIR"
 
-# 1) Ativa venv
-if [ ! -d "venv" ]; then
-  echo "[RUN] Criando venv..."
-  python3 -m venv venv
-fi
-source "venv/bin/activate"
-
+# venv
+if [ ! -d venv ]; then python3 -m venv venv; fi
+source venv/bin/activate
 python --version
 
-# 2) FAST pipeline opcional
-# 1 = rápido para iteração; 0 = completo para resultados finais
-export FAST_PIPELINE=0
+# CUDA env opcional
+[ -f scripts/cuda_env.sh ] && source scripts/cuda_env.sh || true
 
-# 3) Carrega variáveis de CUDA no shell atual
-# use 'source' para persistir
-if [ -f scripts/cuda_env.sh ]; then
-  source scripts/cuda_env.sh
-fi
+# pacotes mínimos
+python -m pip install -U pip >/dev/null
+pip install -q numpy scipy pandas scikit-learn matplotlib pyarrow joblib tqdm "xgboost>=2.0" cupy-cuda12x pycbc
 
-# 4) Bootstrap GPU. Pode falhar sem abortar, MF tem fallback
-bash scripts/bootstrap_gpu.sh "venv" || true
+# ML na GPU
+export ML_MODEL=xgb
+export ML_XGB_DEVICE=cuda
+export ML_STRICT_GPU=1
+export ML_THRESH_STRATEGY=target_far
+export ML_TARGET_FAR=1e-4
 
-# 5) Roda o pipeline
+# PYTHONPATH com fallback vazio para não quebrar com set -u
+export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH-}"
+
 echo "[RUN] Iniciando pipeline…"
 python run.py

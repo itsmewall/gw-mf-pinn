@@ -1,14 +1,13 @@
 # src/training/train_mf.py
 # ======================================================================================
 # Treinador Multi-Fidelity (MF1 + MF2) para detecção binária em janelas GW
-# - Sem CLI. Use train(hparams=None) ou run_mf_stage2(out_dir_root=...)
-# - Lê dataset.parquet e *_windows.hdf5
-# - MF1: encoder raso e barato (low-fidelity)
-# - MF2: encoder mais profundo condicionado em MF1
-# - Perdas: BCE + consistência MF1↔MF2 + distil opcional via scores de baseline (csv)
-# - Amp mista, autocast, grad clip, checkpoint best por AP e por AUC
-# - Augment: time-shift, ruído gaussiano, dropout temporal
-# - Pós-treino: run_mf_stage2 exporta scores, thresholds, summary para o pipeline
+# Uso: import e chame train(hparams=None) ou run_mf_stage2(out_dir_root=...)
+# Lê dataset.parquet e *_windows.hdf5
+# MF1: encoder leve
+# MF2: encoder mais profundo condicionado no MF1
+# Perdas: BCE + consistência MF1↔MF2 + distil opcional via scores externos
+# AMP mista, grad clip, checkpoints por AP e AUC
+# ETA em tempo real com barra tqdm e gravação em runs/mf/<ts>/eta.json
 # ======================================================================================
 
 from __future__ import annotations
@@ -29,6 +28,41 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import roc_auc_score, average_precision_score
+from tqdm import tqdm
+
+# =========================
+# ETA helpers
+# =========================
+def _fmt_hms(seconds: float) -> str:
+    s = int(max(0, seconds))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+class ETAMeter:
+    def __init__(self, alpha: float = 0.12):
+        self.alpha = float(alpha)
+        self.ema = None
+        self.last = None
+        self.steps = 0
+
+    def start_step(self):
+        self.last = time.time()
+
+    def end_step(self):
+        if self.last is None:
+            return
+        dt = time.time() - self.last
+        self.steps += 1
+        if self.ema is None:
+            self.ema = dt
+        else:
+            self.ema = self.alpha * dt + (1.0 - self.alpha) * self.ema
+
+    def eta(self, remaining_steps: int) -> float:
+        if self.ema is None:
+            return float("inf")
+        return max(0.0, self.ema * max(0, int(remaining_steps)))
 
 # =========================
 # Defaults
@@ -66,9 +100,9 @@ class HParams:
     TEACHER_COL: str = "score"             # coluna de score do baseline
 
     # augment
-    AUG_TIMESHIFT_SEC: float = 0.010       # deslocamento aleatório máximo
-    AUG_GAUSS_STD: float    = 0.02         # ruído gaussiano std
-    TIME_DROPOUT_P: float   = 0.03         # zera pontos aleatórios
+    AUG_TIMESHIFT_SEC: float = 0.010
+    AUG_GAUSS_STD: float    = 0.02
+    TIME_DROPOUT_P: float   = 0.03
 
     # modelo
     CH_MF1: int       = 32
@@ -107,8 +141,10 @@ def _read_attrs(obj) -> Dict[str, float | str]:
     try:
         for k, v in obj.attrs.items():
             if hasattr(v, "item"):
-                try: v = v.item()
-                except Exception: pass
+                try:
+                    v = v.item()
+                except Exception:
+                    pass
             out[str(k)] = v
     except Exception:
         pass
@@ -129,7 +165,8 @@ def _cached_start_arrays(win_path: str):
 def _resolve_whitened_path(win_path: str, meta_in: Dict[str,str]) -> Optional[str]:
     src = meta_in.get("source_path") or meta_in.get("source_file") or meta_in.get("source")
     candidates = []
-    if src and os.path.isabs(src): candidates.append(src)
+    if src and os.path.isabs(src):
+        candidates.append(src)
     if src:
         candidates += [
             os.path.join(os.path.dirname(win_path), src),
@@ -143,14 +180,16 @@ def _resolve_whitened_path(win_path: str, meta_in: Dict[str,str]) -> Optional[st
         os.path.join("data","processed", bn),
     ]
     for c in candidates:
-        if c and os.path.exists(c): return os.path.abspath(c)
+        if c and os.path.exists(c):
+            return os.path.abspath(c)
     return None
 
 def _load_window_slice(win_path: str, wht_path: str, start_gps: float, fs_tgt: int, win_sec: float) -> Optional[np.ndarray]:
     try:
         sgps, sidx, _ = _cached_start_arrays(win_path)
         idxs = np.where(np.isclose(sgps, float(start_gps), atol=5e-4))[0]
-        if idxs.size == 0: return None
+        if idxs.size == 0:
+            return None
         i0 = int(sidx[int(idxs[0])])
 
         with h5py.File(wht_path, "r") as g:
@@ -158,17 +197,21 @@ def _load_window_slice(win_path: str, wht_path: str, start_gps: float, fs_tgt: i
             dset = None
             for c in cand:
                 if c in g and isinstance(g[c], h5py.Dataset):
-                    dset = g[c]; break
-            if dset is None: return None
+                    dset = g[c]
+                    break
+            if dset is None:
+                return None
             a_g = _read_attrs(g) | _read_attrs(dset)
             fs_in = a_g.get("fs") or a_g.get("sample_rate")
             if not fs_in:
                 xs = a_g.get("xspacing") or a_g.get("Xspacing")
-                if not xs: return None
+                if not xs:
+                    return None
                 fs_in = 1.0/float(xs)
             fs_in = int(round(float(fs_in)))
             wlen_in = int(round(win_sec*fs_in))
-            if i0 < 0 or (i0 + wlen_in) > int(dset.shape[0]): return None
+            if i0 < 0 or (i0 + wlen_in) > int(dset.shape[0]):
+                return None
             x = dset[i0:i0+wlen_in].astype(np.float32, copy=True)
 
         if fs_in != fs_tgt:
@@ -176,11 +219,15 @@ def _load_window_slice(win_path: str, wht_path: str, start_gps: float, fs_tgt: i
             x = resample_poly(x, frac.numerator, frac.denominator).astype(np.float32, copy=False)
 
         wlen = int(round(win_sec*fs_tgt))
-        if x.size > wlen: x = x[-wlen:]
+        if x.size > wlen:
+            x = x[-wlen:]
         elif x.size < wlen:
-            buf = np.zeros(wlen, np.float32); buf[-x.size:] = x; x = buf
+            buf = np.zeros(wlen, np.float32)
+            buf[-x.size:] = x
+            x = buf
 
-        if not np.any(np.isfinite(x)): return None
+        if not np.any(np.isfinite(x)):
+            return None
         x -= x.mean()
         x /= (x.std() + 1e-12)
         return x
@@ -212,13 +259,13 @@ class WindowsDS(Dataset):
         self.tshift = float(timeshift_sec)
         self.gstd = float(gauss_std)
 
-        # cache por arquivo
         self._wht_cache: Dict[str,str] = {}
 
     def __len__(self): return len(self.df)
 
     def _get_wht(self, fid: str) -> Optional[str]:
-        if fid in self._wht_cache: return self._wht_cache[fid]
+        if fid in self._wht_cache:
+            return self._wht_cache[fid]
         p = self.idx_map.get(fid)
         if not p:
             self._wht_cache[fid] = None
@@ -239,7 +286,8 @@ class WindowsDS(Dataset):
             x = x + np.random.normal(0.0, self.gstd, size=x.shape).astype(np.float32)
         if self.tdp > 0.0:
             mask = np.random.rand(*x.shape) < self.tdp
-            x = x.copy(); x[mask] = 0.0
+            x = x.copy()
+            x[mask] = 0.0
         x = (x - x.mean()) / (x.std() + 1e-12)
         return x
 
@@ -258,7 +306,8 @@ class WindowsDS(Dataset):
             if x is None:
                 L = int(round(self.sec*self.fs))
                 x = np.zeros(L, np.float32)
-        if self.aug: x = self._augment(x)
+        if self.aug:
+            x = self._augment(x)
         t = torch.from_numpy(x).float().unsqueeze(0)  # [1, L]
         teach = float(self.teacher.get((fid, sgps), np.nan))
         return t, torch.tensor(y, dtype=torch.float32), teach, fid, sgps
@@ -270,7 +319,8 @@ class WindowsDS(Dataset):
 class ConvBlock(nn.Module):
     def __init__(self, c_in, c_out, k, s=1, p=None, dropout=0.0):
         super().__init__()
-        if p is None: p = (k-1)//2
+        if p is None:
+            p = (k-1)//2
         self.net = nn.Sequential(
             nn.Conv1d(c_in, c_out, k, stride=s, padding=p, bias=False),
             nn.BatchNorm1d(c_out),
@@ -281,8 +331,8 @@ class ConvBlock(nn.Module):
 
 class MFModel(nn.Module):
     """
-    MF1: leve, gera feature z1 e um logit raso
-    MF2: mais profundo, recebe concat([x, up(z1)]) e gera logit final
+    MF1 gera feature z1 e um logit raso
+    MF2 recebe concat([x, up(z1)]) e gera logit final
     """
     def __init__(self, ch_mf1=32, ch_mf2=48, dropout=0.05):
         super().__init__()
@@ -315,8 +365,9 @@ class MFModel(nn.Module):
         # x: [B,1,L]
         z1 = self.mf1(x)                            # [B,C1,L1]
         y1 = self.mf1_head(z1).squeeze(-1)         # [B]
-        # upsample por repetição para alinhar comprimentos
-        L = x.shape[-1]; L1 = z1.shape[-1]
+        # upsample por repetição
+        L = x.shape[-1]
+        L1 = z1.shape[-1]
         up = F.interpolate(self.proj_z1(z1), size=max(L//4, L1), mode="nearest")
         if up.shape[-1] != x.shape[-1]:
             up = F.interpolate(up, size=L, mode="nearest")
@@ -349,13 +400,16 @@ def eval_epoch(model, dl, device, amp=True):
     return {"auc": auc, "ap": ap, "n": int(y.size)}
 
 def make_teacher_map(csv_path: Optional[str], key_cols=("file_id","start_gps"), val_col="score"):
-    if not csv_path or not os.path.exists(csv_path): return {}
+    if not csv_path or not os.path.exists(csv_path):
+        return {}
     df = pd.read_csv(csv_path)
     need = set(key_cols) | {val_col}
-    if not need.issubset(df.columns): return {}
+    if not need.issubset(df.columns):
+        return {}
     out = {}
     for _, r in df.iterrows():
-        fid = str(r[key_cols[0]]); sgps = float(r[key_cols[1]])
+        fid = str(r[key_cols[0]])
+        sgps = float(r[key_cols[1]])
         sc  = float(r[val_col])
         out[(fid, sgps)] = sc
     return out
@@ -365,7 +419,8 @@ def train(hparams: Optional[Dict] = None):
     hp = HParams()
     if hparams:
         for k, v in hparams.items():
-            if hasattr(hp, k): setattr(hp, k, v)
+            if hasattr(hp, k):
+                setattr(hp, k, v)
 
     set_seed(hp.SEED)
     device = torch.device(hp.DEVICE if torch.cuda.is_available() and hp.DEVICE.startswith("cuda") else "cpu")
@@ -374,6 +429,7 @@ def train(hparams: Optional[Dict] = None):
     ts = time.strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(hp.OUT_DIR, ts)
     os.makedirs(out_dir, exist_ok=True)
+    eta_path = os.path.join(out_dir, "eta.json")
 
     # salva config
     with open(os.path.join(out_dir, "hparams.json"), "w") as f:
@@ -387,19 +443,21 @@ def train(hparams: Optional[Dict] = None):
             split_col = c
             break
     if split_col == "split":
-        df = df.rename(columns={"split":"subset"}); split_col = "subset"
+        df = df.rename(columns={"split":"subset"})
+        split_col = "subset"
     if split_col is None:
-        raise KeyError("dataset.parquet precisa ter coluna subset|split")
+        raise KeyError("dataset.parquet precisa ter coluna subset ou split")
 
     need_cols = {"file_id","start_gps","label","subset"}
-    if not need_cols.issubset(df.columns):
-        raise KeyError(f"Colunas ausentes no parquet: {need_cols - set(df.columns)}")
+    miss = need_cols - set(df.columns)
+    if miss:
+        raise KeyError(f"Colunas ausentes no parquet: {miss}")
 
     idx_map = build_windows_index(hp.WINDOWS_DIR)
 
     # teacher maps
     t_map_val = make_teacher_map(hp.TEACHER_CSV_VAL, val_col=hp.TEACHER_COL)
-    t_map_tst = make_teacher_map(hp.TEACHER_CSV_TST, val_col=hp.TEACHER_COL)
+    t_map_tst = make_teacher_map(hp.TEACHER_CSV_TST, val_col=hp.TEACHER_CSV_TST or "score")
 
     # splits
     df_train = df[df["subset"]=="train"].copy()
@@ -444,6 +502,12 @@ def train(hparams: Optional[Dict] = None):
 
     log_hist = []
 
+    # progresso global
+    total_steps = hp.EPOCHS * max(1, len(dl_tr))
+    global_step = 0
+    pbar = tqdm(total=total_steps, desc="MF2 train", ncols=120)
+    eta_meter = ETAMeter(alpha=0.12)
+
     for epoch in range(1, hp.EPOCHS+1):
         model.train()
         t0 = time.time()
@@ -451,6 +515,8 @@ def train(hparams: Optional[Dict] = None):
         n_steps = 0
 
         for xb, yb, tb, _, _ in dl_tr:
+            eta_meter.start_step()
+
             xb = xb.to(device, non_blocking=True)   # [B,1,L]
             yb = yb.to(device, non_blocking=True)   # [B]
             tb = torch.tensor(tb, dtype=torch.float32, device=device)  # [B]
@@ -460,11 +526,11 @@ def train(hparams: Optional[Dict] = None):
                 y1, y2, z1, h2 = model(xb)
                 loss_bce = bce(y2, yb)
 
-                # consistência MF1 ↔ MF2: aproxima logits
+                # consistência MF1 ↔ MF2
                 loss_consist = F.mse_loss(torch.sigmoid(y1).detach(), torch.sigmoid(y2)) + \
                                F.mse_loss(torch.sigmoid(y1), torch.sigmoid(y2).detach())
 
-                # distillation opcional se existir teacher em batch
+                # distillation opcional
                 has_teacher = torch.isfinite(tb)
                 if has_teacher.any():
                     tnorm = torch.clamp((tb - 0.0) / 1.0, 0.0, 1.0)
@@ -483,6 +549,34 @@ def train(hparams: Optional[Dict] = None):
 
             loss_meter += float(loss.detach().cpu().item())
             n_steps += 1
+
+            # ETA e barra
+            eta_meter.end_step()
+            global_step += 1
+            remaining = max(0, total_steps - global_step)
+            eta_sec = eta_meter.eta(remaining)
+            pbar.set_postfix(
+                epoch=f"{epoch}/{hp.EPOCHS}",
+                loss=f"{loss_meter/max(n_steps,1):.4f}",
+                step=f"{global_step}/{total_steps}",
+                eta=_fmt_hms(eta_sec)
+            )
+            pbar.update(1)
+
+            # grava eta.json periodicamente
+            if global_step % 20 == 0 or remaining == 0:
+                eta_info = {
+                    "epoch": epoch,
+                    "epochs_total": hp.EPOCHS,
+                    "step": global_step,
+                    "steps_total": total_steps,
+                    "avg_batch_sec": None if eta_meter.ema is None else float(eta_meter.ema),
+                    "eta_seconds": float(eta_sec),
+                    "eta_hms": _fmt_hms(eta_sec),
+                    "estimated_finish_unix": time.time() + float(eta_sec)
+                }
+                with open(eta_path, "w") as f:
+                    json.dump(eta_info, f, indent=2)
 
         sched.step()
         dt = time.time() - t0
@@ -520,6 +614,22 @@ def train(hparams: Optional[Dict] = None):
 
         with open(os.path.join(out_dir, "train_log.jsonl"), "a") as f:
             f.write(json.dumps(row) + "\n")
+
+        # snapshot ETA por época
+        remaining_epochs = max(0, hp.EPOCHS - epoch)
+        est_epoch_sec = dt if eta_meter.ema is None else eta_meter.ema * max(1, len(dl_tr))
+        eta_all_sec = remaining_epochs * est_epoch_sec
+        with open(eta_path, "w") as f:
+            json.dump({
+                "epoch": epoch,
+                "epochs_total": hp.EPOCHS,
+                "avg_epoch_sec": float(est_epoch_sec),
+                "eta_seconds": float(eta_all_sec),
+                "eta_hms": _fmt_hms(eta_all_sec),
+                "estimated_finish_unix": time.time() + float(eta_all_sec)
+            }, f, indent=2)
+
+    pbar.close()
 
     # resumo final
     summary = {
@@ -580,27 +690,29 @@ def _confusion_at_thr(labels, scores, thr):
     return tn, fp, fn, tp
 
 @torch.no_grad()
-def _predict_scores(model, dl, device):
+def _predict_scores(model, dl, device, desc="scoring"):
     model.eval()
     rows = []
+    pbar = tqdm(total=len(dl), desc=desc, ncols=120)
     for xb, yb, _, fid, sgps in dl:
         xb = xb.to(device, non_blocking=True)
-        yb = yb.float().cpu().numpy()
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type=="cuda")):
             _, y2, _, _ = model(xb)
             p = torch.sigmoid(y2).detach().float().cpu().numpy()
+        yb = yb.float().cpu().numpy()
         for i in range(len(p)):
             rows.append((str(fid[i]), float(sgps[i]), int(yb[i]), float(p[i])))
-    df = pd.DataFrame(rows, columns=["file_id","start_gps","label","score"])
-    return df
+        pbar.update(1)
+    pbar.close()
+    return pd.DataFrame(rows, columns=["file_id","start_gps","label","score"])
 
 def run_mf_stage2(out_dir_root: Optional[str] = None):
     """
-    Treina via train() e exporta scores/thresholds/summary no formato esperado pelo pipeline.
+    Treina via train() e exporta scores, thresholds e summary no formato do pipeline.
     """
     hp = HParams()
     # 1) Treino
-    sum_train = train()  # usa defaults de HParams, pode ser override via run.py se quiser
+    sum_train = train()
     best_path = sum_train.get("best_ap_path") or sum_train.get("best_auc_path")
     if not best_path or not os.path.exists(best_path):
         raise RuntimeError("MF2 treinou, mas não encontrei best_*_path no resumo.")
@@ -632,19 +744,19 @@ def run_mf_stage2(out_dir_root: Optional[str] = None):
     dl_te = DataLoader(ds_te, batch_size=max(256, hp.BATCH), shuffle=False,
                        num_workers=hp.NUM_WORKERS, pin_memory=hp.PIN_MEMORY)
 
-    # 4) Carrega melhor checkpoint
+    # 4) Checkpoint
     device = torch.device("cuda" if torch.cuda.is_available() and hp.DEVICE.startswith("cuda") else "cpu")
     model = MFModel(ch_mf1=hp.CH_MF1, ch_mf2=hp.CH_MF2, dropout=hp.DROPOUT).to(device)
     state = torch.load(best_path, map_location=device)
     model.load_state_dict(state["state_dict"], strict=False)
 
-    # 5) Gera scores
+    # 5) Scores
     val_csv  = os.path.join(out_dir, "scores_val.csv")
     test_csv = os.path.join(out_dir, "scores_test.csv")
-    _predict_scores(model, dl_va, device).to_csv(val_csv, index=False)
-    _predict_scores(model, dl_te, device).to_csv(test_csv, index=False)
+    _predict_scores(model, dl_va, device, desc="MF2 scoring VAL").to_csv(val_csv, index=False)
+    _predict_scores(model, dl_te, device, desc="MF2 scoring TEST").to_csv(test_csv, index=False)
 
-    # 6) Threshold por FAR alvo e summary
+    # 6) Threshold e summary
     val_df  = pd.read_csv(val_csv)
     test_df = pd.read_csv(test_csv)
 
@@ -660,7 +772,7 @@ def run_mf_stage2(out_dir_root: Optional[str] = None):
         json.dump({
             "cfg": {"MODE": "constrained_roc", "TARGET_FAR": 1e-4},
             "gpu": {"requested": True, "available": torch.cuda.is_available()},
-            "val": {},  # detalhado não obrigatório aqui
+            "val": {},
             "test": {
                 "auc": None, "ap": None,
                 "confusion_at_thr": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},

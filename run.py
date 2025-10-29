@@ -2,11 +2,12 @@
 # --------------------------------------------------------------------------------------
 # Motor global SEM ARGUMENTOS: GWOSC -> preprocess -> windows -> dataset -> baselines (ML/MF)
 # Configure pelos TOGGLES abaixo. Logs em logs/pipeline.log
-# Requisitos: requests, h5py, numpy, scipy, tqdm, pyyaml, gwosc, pandas, scikit-learn, joblib, pycbc
+# Requisitos: requests, h5py, numpy, scipy, tqdm, pyyaml, gwosc, pandas, scikit-learn,
+# joblib, pycbc, torch (se MF2 for usado)
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
-import os, sys, time, glob, shutil, re, logging, json, traceback, random
+import os, sys, time, glob, shutil, re, logging, json, traceback
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ if SRC not in sys.path:
 from gwdata import preprocess as pp
 from gwdata.windows import process_whitened_file
 
-# Modulos de eval expõem main(); chamaremos direto:
+# Módulos de eval expõem main(); chamaremos direto
 from eval import dataset_builder as dsb
 from eval import baseline_ml as bml
 from eval import mf_baseline as mbf
@@ -38,32 +39,32 @@ from viz import plot_scores_timeline as viz_timeline
 from viz import ligo_overlay as viz_overlay
 
 # ============================================================
-# TOGGLES - ligue ou desligue estágios
+# TOGGLES
 # ============================================================
-ENABLE_DOWNLOAD      = False   # baixa GWOSC
-ENABLE_WHITEN        = True   # pré-processa arquivos novos
-ENABLE_WINDOWS       = True    # gera janelas para arquivos novos
-ENABLE_DATASET       = True    # recria dataset.parquet
-ENABLE_BASELINE_ML   = True    # roda baseline_ml.py
-ENABLE_MF_BASELINE   = True    # roda mf_baseline.py
-ENABLE_MF_STAGE2     = True    # roda MF Stage 2 em training/train_mf
+ENABLE_DOWNLOAD      = False
+ENABLE_WHITEN        = True
+ENABLE_WINDOWS       = True
+ENABLE_DATASET       = True
+ENABLE_BASELINE_ML   = True
+ENABLE_MF_BASELINE   = True
+ENABLE_MF_STAGE2     = True
 
 # Pós MF2
-ENABLE_POST_MF2_FREEZE    = True   # passo 1: congelar artefatos
-ENABLE_POST_MF2_EXPORT    = True   # passo 2: exportar candidatos
-ENABLE_POST_MF2_COINC     = True   # passo 3: coincidencia + FAR time slides
-ENABLE_POST_MF2_CALIBRATE = True   # passo 4: calibracao isotonica
+ENABLE_POST_MF2_FREEZE    = True
+ENABLE_POST_MF2_EXPORT    = True
+ENABLE_POST_MF2_COINC     = True
+ENABLE_POST_MF2_CALIBRATE = True
 
 # Pré-flight
-ENABLE_PREFLIGHT        = True   # liga o sanity check antes dos estágios
-PREFLIGHT_FAIL_FAST     = True   # se True, aborta o pipeline em falha crítica
-PREFLIGHT_SAMPLE_VAL    = 64     # janelas para smoke do MF
-PREFLIGHT_MIN_WINDOWS   = 1      # pelo menos 1 arquivo *_windows.hdf5
-PREFLIGHT_MIN_WHITENED  = 1      # pelo menos 1 arquivo *_whitened.hdf5
-PREFLIGHT_MIN_DISK_GB   = 3      # espaço livre minimo em GB
+ENABLE_PREFLIGHT        = True
+PREFLIGHT_FAIL_FAST     = True
+PREFLIGHT_SAMPLE_VAL    = 64
+PREFLIGHT_MIN_WINDOWS   = 1
+PREFLIGHT_MIN_WHITENED  = 1
+PREFLIGHT_MIN_DISK_GB   = 3
 
-# PERFIL de download (se ENABLE_DOWNLOAD=True)
-PROFILE = "extended"            # "initial" | "extended" | "full"
+# PERFIL de download
+PROFILE = "extended"            # initial | extended | full
 
 # Diretórios
 DATA_RAW       = os.path.join(ROOT, "data", "raw")
@@ -76,7 +77,7 @@ LOG_DIR        = os.path.join(ROOT, "logs")
 PREFER_HDF5           = True
 PREFER_4KHZ           = True
 PREFER_DURATION_4096S = True
-ALLOW_DETECTORS       = {"H1", "L1"}   # inclua "V1" se quiser
+ALLOW_DETECTORS       = {"H1", "L1"}
 
 # Quotas por perfil
 if PROFILE == "initial":
@@ -95,7 +96,7 @@ else:
     MAX_FILES_PER_EVENT        = 100
     MAX_SINGLE_FILE_BYTES      = 8 * 1024**3
 
-STOP_SENTINEL = "STOP"         # criar um arquivo STOP na raiz interrompe downloads
+STOP_SENTINEL = "STOP"
 
 # ============================================================
 # PRE PROCESSAMENTO
@@ -120,9 +121,9 @@ SAVE_WINDOWS   = False
 # ============================================================
 # GWOSC API v2
 # ============================================================
-GWOSC        = "https://gwosc.org"
-EVENTS_API   = f"{GWOSC}/api/v2/event-versions"
-STRAIN_API   = f"{GWOSC}/api/v2/events"
+GWOSC      = "https://gwosc.org"
+EVENTS_API = f"{GWOSC}/api/v2/event-versions"
+STRAIN_API = f"{GWOSC}/api/v2/events"
 
 # ============================================================
 # LOGGING
@@ -192,7 +193,6 @@ def _summarize_latest_mf(logger):
         tinfo = s.get("threshold_info", {})
         conf = test.get("confusion_at_thr", {}) or {}
         tn, fp, fn, tp = (conf.get("tn",0), conf.get("fp",0), conf.get("fn",0), conf.get("tp",0))
-
         prec = tp / max(tp+fp, 1)
         rec  = tp / max(tp+fn, 1)
         fpr  = fp / max(tn+fp, 1)
@@ -215,8 +215,32 @@ def _latest_mf2_run_dir() -> Optional[str]:
     root = os.path.join(REPORTS_DIR, "mf_stage2")
     return _latest_subdir(root)
 
+def freeze_split_after_dataset():
+    base = os.path.join(DATA_PROCESSED, "dataset.parquet")
+    side = os.path.join(DATA_PROCESSED, "dataset_with_split.parquet")
+    if not (os.path.exists(base) and os.path.exists(side)):
+        return
+    df_base = pd.read_parquet(base)
+    df_side = pd.read_parquet(side)
+    keys = [c for c in ["file_id", "start_gps"] if c in df_base.columns and c in df_side.columns]
+    if len(keys) < 2:
+        print("[FREEZE] chaves insuficientes para restaurar split")
+        return
+    keep = keys + [c for c in ["split", "subset"] if c in df_side.columns]
+    df_side = df_side[keep].drop_duplicates()
+    if "subset" in df_side.columns and "split" not in df_side.columns:
+        df_side = df_side.rename(columns={"subset": "split"})
+    df_out = df_base.drop(columns=["split", "subset"], errors="ignore").merge(df_side, on=keys, how="left")
+    miss = df_out["split"].isna().sum()
+    if miss:
+        print(f"[FREEZE] {miss} linhas sem split no sidecar. Atribuindo train.")
+        df_out["split"] = df_out["split"].fillna("train")
+    df_out.to_parquet(side, index=False)
+    df_out.to_parquet(base, index=False)
+    print(f"[FREEZE] split restaurado em {base} e {side}")
+
 # ============================================================
-# PRÉ-FLIGHT: smoke tests estruturais e funcionais
+# PRÉ-FLIGHT
 # ============================================================
 @dataclass
 class TestResult:
@@ -294,7 +318,7 @@ def preflight(logger) -> List[TestResult]:
             raise ValueError("labels com NaN")
         labs = set(int(x) for x in df["label"].unique())
         if not labs.issubset({0,1}):
-            raise ValueError(f"labels fora de {0,1}: {labs}")
+            raise ValueError(f"labels fora de {{0,1}}: {labs}")
         subs = set(df["subset"].astype(str).unique())
         if not {"val","test"}.intersection(subs):
             raise ValueError("subset sem val ou test")
@@ -377,7 +401,7 @@ def preflight(logger) -> List[TestResult]:
             return f"rows={len(df_sub)} templates={len(cache)} smax={smax:.4f}"
     run("mf_smoke_cpu", True, test_mf_smoke)
 
-    # 7) ML baseline: sanidade estrutural e callable
+    # 7) ML baseline
     def test_ml_presence():
         if not hasattr(bml, "main") or not callable(bml.main):
             raise RuntimeError("baseline_ml sem função main()")
@@ -395,10 +419,13 @@ def preflight(logger) -> List[TestResult]:
     # 8) MF2 presença opcional
     def test_mf2_presence():
         try:
-            from training.train_mf import run_mf_stage2  # noqa
+            import importlib.util, pathlib
+            tmf_path = pathlib.Path(SRC) / "training" / "train_mf.py"
+            if tmf_path.exists():
+                return "training.train_mf disponível por caminho de arquivo"
+            return "MF2 opcional ausente: train_mf.py não encontrado"
         except Exception as e:
             return f"MF2 opcional ausente: {e}"
-        return "training.train_mf.run_mf_stage2 disponível"
     run("mf2_presence", False, test_mf2_presence)
 
     # 9) CuPy opcional
@@ -411,7 +438,6 @@ def preflight(logger) -> List[TestResult]:
             return f"CuPy indisponível: {e}"
     run("gpu_optional_cupy", False, test_gpu_optional)
 
-    # Log resumido
     ok_all = True
     logging.getLogger("pipeline").info("=============== PREFLIGHT ===============")
     for r in results:
@@ -542,7 +568,7 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
     return downloaded
 
 # ============================================================
-# ESTAGIOS
+# ESTÁGIOS
 # ============================================================
 def stage_download(logger) -> Dict[str, int]:
     if not ENABLE_DOWNLOAD:
@@ -662,15 +688,49 @@ def stage_mf_stage2(logger) -> Optional[str]:
     if not ENABLE_MF_STAGE2:
         logger.info("[MF2] Multi Fidelity Stage 2 desativado.")
         return None
+
     logger.info("[MF2] Treinando MF Stage 2 …")
-    try:
-        from training.train_mf import run_mf_stage2
-    except Exception as e:
-        logger.error(f"[MF2] Import falhou: {e}")
+
+    import importlib.util, sys
+
+    tmf_path = os.path.join(SRC, "training", "train_mf.py")
+    if not os.path.exists(tmf_path):
+        logger.error(f"[MF2] train_mf.py não encontrado em {tmf_path}")
         return None
+
+    # use um nome de pacote estável
+    spec = importlib.util.spec_from_file_location("training.train_mf", tmf_path)
+    mf2_dyn = importlib.util.module_from_spec(spec)
+
+    # registrar antes de executar, para o dataclass enxergar o módulo
+    sys.modules[spec.name] = mf2_dyn
+    mf2_dyn.__package__ = "training"
+
     try:
-        run_mf_stage2()
-        return "mf_stage2"
+        spec.loader.exec_module(mf2_dyn)  # type: ignore
+    except Exception as e:
+        logger.error(f"[MF2] Falha ao carregar {tmf_path}: {e}")
+        return None
+
+    out_root = os.path.join(REPORTS_DIR, "mf_stage2")
+    os.makedirs(out_root, exist_ok=True)
+
+    try:
+        if hasattr(mf2_dyn, "run_mf_stage2") and callable(mf2_dyn.run_mf_stage2):
+            mf2_dyn.run_mf_stage2(out_dir_root=out_root)
+            return "mf_stage2"
+        elif hasattr(mf2_dyn, "train") and callable(mf2_dyn.train):
+            hp = {
+                "PARQUET_PATH": os.path.join(DATA_PROCESSED, "dataset.parquet"),
+                "WINDOWS_DIR": DATA_PROCESSED,
+                "OUT_DIR": out_root,
+                "DEVICE": "cuda",
+            }
+            mf2_dyn.train(hparams=hp)
+            return "mf_stage2"
+        else:
+            logger.error("[MF2] train_mf.py não expõe run_mf_stage2() nem train().")
+            return None
     except Exception as e:
         logger.error(f"[MF2] Execução falhou: {e}")
         return None
@@ -888,6 +948,7 @@ def main():
     # 4) DATASET
     t = _timer()
     ds_stats = stage_dataset(logger)
+    freeze_split_after_dataset()
     logger.info(f"[DS] Concluído em {t():.1f}s | linhas={ds_stats['rows']} | pos={ds_stats['pos']}")
 
     # 5) BASELINE ML
