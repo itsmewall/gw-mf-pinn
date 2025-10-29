@@ -108,27 +108,32 @@ def cosine_scores(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return num / denom
 
 def _preselect_templates(
-    X_batch: np.ndarray,            # [B, L] janelas normalizadas do batch
+    X_batch: np.ndarray,                  # [B, L] janelas normalizadas do batch
+    keys_scope: List[str],                # lista de chaves efetiva (já após subamostragem)
     tmpl_cache: Dict[str, np.ndarray],
     topk: int
-) -> List[int]:
+) -> List[str]:
     """
-    Retorna indices dos topk templates mais promissores para o batch,
-    por media do |cosine| entre janelas e cada template.
+    Pré-seleciona os 'topk' templates mais promissores DENTRO de keys_scope,
+    usando média do |cosine| entre janelas do batch e cada template.
+    Retorna uma lista de chaves (nomes), não índices.
     """
-    keys_all = list(tmpl_cache.keys())
-    K = len(keys_all)
-    if topk <= 0 or (topk >= K) or (K == 0):
-        return list(range(K))
+    if not keys_scope:
+        return []
+    K = len(keys_scope)
+    if topk <= 0 or topk >= K:
+        return list(keys_scope)
 
-    T = np.stack([tmpl_cache[k] for k in keys_all], axis=0).astype(np.float32, copy=False)
+    # Monta matriz de templates no escopo atual, respeitando a ordem de keys_scope
+    T = np.stack([tmpl_cache[k] for k in keys_scope], axis=0).astype(np.float32, copy=False)
 
     def _safe_norm(x):
         return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+
     Xn = _safe_norm(X_batch.astype(np.float32, copy=False))
     Tn = _safe_norm(T)
 
-    # GPU se disponivel
+    # GPU acelerado se disponível via gwcuda; senão CPU
     use_cuda = bool(HAVE_GWCUDA)
     if use_cuda:
         try:
@@ -140,15 +145,15 @@ def _preselect_templates(
 
     score = np.nanmean(np.abs(S), axis=0)  # [K]
     topk = int(max(1, min(topk, K)))
-    idx = np.argpartition(score, -topk)[-topk:]
-    idx = idx[np.argsort(score[idx])]      # crescente
-    return idx.tolist()
+    idx = np.argpartition(score, -topk)[-topk:]      # índices relativos a keys_scope
+    idx = idx[np.argsort(score[idx])]                # crescente por score
+    return [keys_scope[i] for i in idx]
 
 # =========================
 # CONFIG
 # =========================
 @dataclass
-class CFG:
+class Cfg:
     # dataset
     PARQUET_PATH: str = "data/processed/dataset.parquet"
     WINDOWS_DIR: str   = "data/processed"
@@ -160,11 +165,11 @@ class CFG:
 
     # GPU
     USE_GPU: bool = True
-    GPU_INIT_BATCH_WIN: int = 8192
+    GPU_INIT_BATCH_WIN: int = int(os.getenv("MF_GPU_INIT_BATCH_WIN", "8192"))
     GPU_MIN_BATCH_WIN: int  = 256
-    GPU_INIT_TEMPL_CHUNK: int = 128
+    GPU_INIT_TEMPL_CHUNK: int = int(os.getenv("MF_GPU_INIT_TEMPL_CHUNK", "128"))
     GPU_MIN_TEMPL_CHUNK: int = 8
-    GPU_VRAM_UTIL_FRAC: float = 0.85
+    GPU_VRAM_UTIL_FRAC: float = float(os.getenv("MF_GPU_VRAM_UTIL", "0.85"))
     USE_FP16_TIME: bool = True
 
     # CPU nativo
@@ -201,7 +206,7 @@ class CFG:
     MAX_TEST_ROWS: Optional[int] = 60000
 
     # thresholds
-    MODE: str = "target_far"  # target_far, constrained_roc, best_f1
+    MODE: str = "constrained_roc"  # target_far, constrained_roc, best_f1
     TARGET_FAR: float = 1e-4
     MIN_RECALL_AT_FPR: float = 0.01
 
@@ -247,7 +252,7 @@ class CFG:
         (5.0, 40.0), (10.0, 50.0), (20.0, 80.0)
     )
 
-CFG = CFG()
+CFG = Cfg()
 
 # =========================
 # Helpers
@@ -291,6 +296,11 @@ def patch_cfg(**over):
 def cache_name_for(m1rng, m2rng, n, subs):
     m1a, m1b = m1rng; m2a, m2b = m2rng
     return f"tmplcache_m1_{m1a:.0f}-{m1b:.0f}_m2_{m2a:.0f}-{m2b:.0f}_n{n}_sub{subs}.npz"
+
+def safe_auc_ap(y, s):
+    if np.unique(y).size < 2:
+        return None, None
+    return float(roc_auc_score(y, s)), float(average_precision_score(y, s))
 
 # =========================
 # Index de windows e caches
@@ -679,8 +689,8 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                 # Pre-selecao de templates neste batch
                 if CFG.PRESELECT_ENABLE:
                     X_probe = Xv if Xv.shape[0] <= 512 else Xv[:512]
-                    sel_idx = _preselect_templates(X_probe, tmpl_cache, CFG.PRESELECT_TOPK_TEMPL)
-                    keys_selected = [keys[i] for i in sel_idx]
+                    sel_keys = _preselect_templates(X_probe, keys, tmpl_cache, CFG.PRESELECT_TOPK_TEMPL)
+                    keys_selected = sel_keys
                 else:
                     keys_selected = keys
 
@@ -761,6 +771,7 @@ def score_subset_gpu_streaming(name: str, df_sub: pd.DataFrame, idx_map: Dict[st
                         cp.get_default_memory_pool().free_all_blocks()
 
                 best_host = agg.get() if topk == 1 else cp.mean(agg, axis=1).get()
+                cp.get_default_memory_pool().free_all_blocks()
 
                 pos_valid = np.where(mask_valid)[0]
                 for j, val in zip(pos_valid, best_host):
@@ -914,8 +925,8 @@ def score_subset_cpu(name: str, df_sub: pd.DataFrame, idx_map: Dict[str,str],
                 continue
             X_probe.append(x.astype(np.float32, copy=False))
         if len(X_probe) >= 8:
-            sel_idx = _preselect_templates(np.stack(X_probe, 0), tmpl_cache, CFG.PRESELECT_TOPK_TEMPL)
-            keys = [keys[i] for i in sel_idx]
+            keys = _preselect_templates(np.stack(X_probe, 0), keys, tmpl_cache, CFG.PRESELECT_TOPK_TEMPL)
+
 
     templates_host = [tmpl_cache[k] for k in keys]
 
@@ -1040,8 +1051,11 @@ def pick_threshold(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict]
         if neg.size == 0:
             return 0.0, {"mode": "target_far", "far": CFG.TARGET_FAR, "note": "no_neg"}
         fpr, tpr, thr_arr = roc_curve(y_true, scores)
-        i = int(np.argmin(np.abs(fpr - CFG.TARGET_FAR)))
-        thr = float(thr_arr[max(0, min(i, len(thr_arr)-1))])
+        if not np.isfinite(fpr).any() or len(thr_arr) == 0:
+            thr = float(np.percentile(scores, 99.9)) if scores.size else 0.0
+        else:
+            i = int(np.argmin(np.abs(fpr - CFG.TARGET_FAR)))
+            thr = float(thr_arr[max(0, min(i, len(thr_arr)-1))])
         return _safe_thr_after_pick(thr, scores), {"mode": "target_far", "far": CFG.TARGET_FAR}
     # best_f1
     thr_cand = np.unique(scores)
@@ -1334,6 +1348,23 @@ def sweep_parameters(df_val_full: pd.DataFrame, idx_map: Dict[str,str], out_dir:
     return best["row"]
 
 # =========================
+# Smoke check para o preflight
+# =========================
+def mf_smoke(min_val: int = 50, min_test: int = 50):
+    df = pd.read_parquet(CFG.PARQUET_PATH)
+    col = "subset" if "subset" in df.columns else ("split" if "split" in df.columns else None)
+    if col is None:
+        raise RuntimeError("dataset sem subset/split")
+    val = df[df[col].eq("val")]
+    test = df[df[col].eq("test")]
+    if len(val) < min_val or len(test) < min_test:
+        raise RuntimeError("sem linhas suficientes para smoke MF")
+    idx_map = build_windows_index(CFG.WINDOWS_DIR)
+    if not idx_map:
+        raise RuntimeError("nenhum *_windows.hdf5 encontrado")
+    return {"val": len(val), "test": len(test), "wins": len(idx_map)}
+
+# =========================
 # MAIN
 # =========================
 def main():
@@ -1373,6 +1404,10 @@ def main():
     if CFG.MAX_VAL_ROWS:  df_val  = df_val.head(CFG.MAX_VAL_ROWS).copy()
     if CFG.MAX_TEST_ROWS: df_test = df_test.head(CFG.MAX_TEST_ROWS).copy()
     _log(f"[1/6] Dataset OK val={len(df_val):,} test={len(df_test):,}")
+    if len(df_val) == 0 or len(df_test) == 0:
+        raise RuntimeError(f"Subsets vazios. val={len(df_val)} test={len(df_test)}")
+    if int(df_val["label"].sum()) == 0:
+        _log("[WARN] VAL sem positivos. Threshold pode ficar degenerado. Considere reamostrar.")
 
     _log("[2/6] Indexando *_windows.hdf5")
     idx_map = build_windows_index(CFG.WINDOWS_DIR)

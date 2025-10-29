@@ -431,7 +431,10 @@ def train(hparams: Optional[Dict] = None):
         opt = torch.optim.Adam(model.parameters(), lr=hp.LR, weight_decay=hp.WD)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(hp.EPOCHS, 1))
 
-    scaler = torch.cuda.amp.GradScaler(enabled=hp.AMP and device.type=="cuda")
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=(hp.AMP and device.type == "cuda")
+    )
 
     bce = nn.BCEWithLogitsLoss()
 
