@@ -1,9 +1,6 @@
 # run.py
 # --------------------------------------------------------------------------------------
-# Motor global SEM ARGUMENTOS: GWOSC -> preprocess -> windows -> dataset -> baselines (ML/MF)
-# Configure pelos TOGGLES abaixo. Logs em logs/pipeline.log
-# Requisitos: requests, h5py, numpy, scipy, tqdm, pyyaml, gwosc, pandas, scikit-learn,
-# joblib, pycbc, torch (se MF2 for usado)
+# Motor global: GWOSC -> preprocess -> windows -> dataset -> baselines -> MF2
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -29,25 +26,34 @@ if SRC not in sys.path:
 from gwdata import preprocess as pp
 from gwdata.windows import process_whitened_file
 
-# Módulos de eval expõem main(); chamaremos direto
+# Módulos de eval expõem main
 from eval import dataset_builder as dsb
 from eval import baseline_ml as bml
 from eval import mf_baseline as mbf
 
-# Viz
+# Viz existentes
 from viz import plot_scores_timeline as viz_timeline
 from viz import ligo_overlay as viz_overlay
+
+# Viz nova (ondas)
+try:
+    from viz.waveview import demo_plot as viz_wave_demo
+except Exception:
+    viz_wave_demo = None
 
 # ============================================================
 # TOGGLES
 # ============================================================
 ENABLE_DOWNLOAD      = False
-ENABLE_WHITEN        = False
-ENABLE_WINDOWS       = False
-ENABLE_DATASET       = False
-ENABLE_BASELINE_ML   = False
-ENABLE_MF_BASELINE   = False
+ENABLE_WHITEN        = True
+ENABLE_WINDOWS       = True
+ENABLE_DATASET       = True
+ENABLE_BASELINE_ML   = True
+ENABLE_MF_BASELINE   = True
 ENABLE_MF_STAGE2     = True
+
+# Visualização de ondas
+ENABLE_VIZ_WAVE      = True
 
 # Pós MF2
 ENABLE_POST_MF2_FREEZE    = True
@@ -55,7 +61,7 @@ ENABLE_POST_MF2_EXPORT    = True
 ENABLE_POST_MF2_COINC     = True
 ENABLE_POST_MF2_CALIBRATE = True
 
-# Pré-flight
+# Pré flight
 ENABLE_PREFLIGHT        = True
 PREFLIGHT_FAIL_FAST     = True
 PREFLIGHT_SAMPLE_VAL    = 64
@@ -63,7 +69,7 @@ PREFLIGHT_MIN_WINDOWS   = 1
 PREFLIGHT_MIN_WHITENED  = 1
 PREFLIGHT_MIN_DISK_GB   = 3
 
-# PERFIL de download
+# Perfil de download
 PROFILE = "extended"            # initial | extended | full
 
 # Diretórios
@@ -240,7 +246,7 @@ def freeze_split_after_dataset():
     print(f"[FREEZE] split restaurado em {base} e {side}")
 
 # ============================================================
-# PRÉ-FLIGHT
+# PRÉ FLIGHT
 # ============================================================
 @dataclass
 class TestResult:
@@ -325,7 +331,7 @@ def preflight(logger) -> List[TestResult]:
         return f"rows={len(df)} subsets={sorted(subs)}"
     run("dataset_structure", True, test_dataset_parquet)
 
-    # 4) Leitura de janela + map para whitened via meta
+    # 4) Leitura de janela
     def test_window_slice():
         idx = mbf.build_windows_index(DATA_PROCESSED)
         if not idx:
@@ -449,7 +455,7 @@ def preflight(logger) -> List[TestResult]:
     logging.getLogger("pipeline").info("=========================================")
 
     if PREFLIGHT_FAIL_FAST and not ok_all:
-        raise SystemExit("Pré-flight falhou em teste crítico. Abortado.")
+        raise SystemExit("Pré flight falhou em teste crítico. Abortado.")
 
     logging.getLogger("pipeline").info(f"[PREFLIGHT] ok={sum(r.ok for r in results)}/{len(results)}")
     return results
@@ -509,13 +515,13 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
     os.makedirs(out_dir, exist_ok=True)
     items = fetch_strain_files_for_event(event)
     if not items:
-        logger.info(f"[GWOSC] {event}: nenhum strain-file disponível.")
+        logger.info(f"[GWOSC] {event}: nenhum strain file disponível.")
         return 0
 
     downloaded = 0
     for item in items:
         if os.path.exists(os.path.join(ROOT, STOP_SENTINEL)):
-            logger.warning("[GWOSC] STOP detectado - interrompendo downloads com segurança.")
+            logger.warning("[GWOSC] STOP detectado. Interrompendo downloads.")
             break
         if downloaded >= MAX_FILES_PER_EVENT:
             logger.info(f"[GWOSC] {event}: limite {MAX_FILES_PER_EVENT} atingido.")
@@ -536,17 +542,17 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
         try:
             head = requests.head(url, timeout=30, allow_redirects=True)
             head.raise_for_status()
-            size = int(head.headers.get("Content-Length", "0")) if head.headers.get("Content-Length") else 0
+            size = int(head.headers.get("Content Length", "0")) if head.headers.get("Content Length") else 0
         except Exception:
             size = 0
 
         if size and size > MAX_SINGLE_FILE_BYTES:
-            logger.info(f"[GWOSC] {event}: {fname} ({size/1e9:.2f} GB) > limite. Pulando.")
+            logger.info(f"[GWOSC] {event}: {fname} ({size/1e9:.2f} GB) maior que o limite. Pulando.")
             continue
 
         need = size if size else 256 * 1024**2
         if (budget_state["bytes"] + need) > MAX_DOWNLOAD_BYTES_PER_RUN:
-            logger.info("[GWOSC] Ultrapassaria cota - parando.")
+            logger.info("[GWOSC] Ultrapassaria cota. Parando.")
             break
         if not _enough_space(out_dir, need):
             logger.error("[GWOSC] Espaço em disco insuficiente.")
@@ -555,12 +561,14 @@ def ensure_event_downloaded(event: str, out_dir: str, budget_state: Dict[str, in
         logger.info(f"[GWOSC] {event}: baixando {fname} ...")
         with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
-            total = int(r.headers.get("Content-Length", 0)) or None
+            total = int(r.headers.get("Content Length", 0)) or None
             with open(fpath, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc=f"↓ {fname}", leave=False) as pbar:
                 for chunk in r.iter_content(chunk_size=1 << 14):
-                    if not chunk: continue
+                    if not chunk:
+                        continue
                     f.write(chunk)
-                    if total: pbar.update(len(chunk))
+                    if total:
+                        pbar.update(len(chunk))
 
         downloaded += 1
         budget_state["bytes"] += (total or need)
@@ -596,7 +604,7 @@ def stage_whiten(logger) -> List[str]:
     os.makedirs(DATA_INTERIM, exist_ok=True)
     raw_files = _list_files(os.path.join(DATA_RAW, "*.hdf5"))
     saved = []
-    for fpath in tqdm(raw_files, desc="[PP] Pré-processando (novos)", unit="arq"):
+    for fpath in tqdm(raw_files, desc="[PP] Pré processando (novos)", unit="arq"):
         base = os.path.basename(fpath)
         out_name = base.replace(".hdf5", "_whitened.hdf5")
         out_path = os.path.join(DATA_INTERIM, out_name)
@@ -655,7 +663,7 @@ def stage_dataset(logger) -> Dict[str, int]:
     if not ENABLE_DATASET:
         logger.info("[DS] Dataset builder desativado.")
         return {"rows": 0, "pos": 0}
-    logger.info("[DS] Construindo dataset.parquet …")
+    logger.info("[DS] Construindo dataset.parquet ...")
     dsb.main()
     meta_path = os.path.join(DATA_PROCESSED, "dataset_meta.json")
     if os.path.exists(meta_path):
@@ -672,7 +680,7 @@ def stage_baseline_ml(logger) -> Optional[str]:
     if not ENABLE_BASELINE_ML:
         logger.info("[ML] Baseline ML desativado.")
         return None
-    logger.info("[ML] Rodando baseline_ml …")
+    logger.info("[ML] Rodando baseline_ml ...")
     bml.main()
     return "baseline_ml"
 
@@ -680,7 +688,7 @@ def stage_mf_baseline(logger) -> Optional[str]:
     if not ENABLE_MF_BASELINE:
         logger.info("[MF] Matched Filtering baseline desativado.")
         return None
-    logger.info("[MF] Rodando mf_baseline …")
+    logger.info("[MF] Rodando mf_baseline ...")
     mbf.main()
     return "mf_baseline"
 
@@ -689,7 +697,7 @@ def stage_mf_stage2(logger) -> Optional[str]:
         logger.info("[MF2] Multi Fidelity Stage 2 desativado.")
         return None
 
-    logger.info("[MF2] Treinando MF Stage 2 …")
+    logger.info("[MF2] Treinando MF Stage 2 ...")
 
     import importlib.util, sys
 
@@ -698,11 +706,8 @@ def stage_mf_stage2(logger) -> Optional[str]:
         logger.error(f"[MF2] train_mf.py não encontrado em {tmf_path}")
         return None
 
-    # use um nome de pacote estável
     spec = importlib.util.spec_from_file_location("training.train_mf", tmf_path)
     mf2_dyn = importlib.util.module_from_spec(spec)
-
-    # registrar antes de executar, para o dataclass enxergar o módulo
     sys.modules[spec.name] = mf2_dyn
     mf2_dyn.__package__ = "training"
 
@@ -736,7 +741,7 @@ def stage_mf_stage2(logger) -> Optional[str]:
         return None
 
 # ------------------------------------------------------------
-# Pós MF2: FREEZE, EXPORT, COINC, CALIBRATE
+# Pós MF2
 # ------------------------------------------------------------
 def stage_post_mf2_freeze(logger) -> Optional[str]:
     if not ENABLE_POST_MF2_FREEZE:
@@ -749,7 +754,7 @@ def stage_post_mf2_freeze(logger) -> Optional[str]:
     need = ["summary.json", "thresholds.json", "scores_val.csv", "scores_test.csv"]
     missing = [n for n in need if not os.path.exists(os.path.join(run, n))]
     if missing:
-        logger.info(f"[MF2:FREEZE] aguardando arquivos: {missing}. Pulando por enquanto.")
+        logger.info(f"[MF2:FREEZE] aguardando arquivos: {missing}. Pulando.")
         return None
     out = os.path.join("artifacts", "mf2", os.path.basename(run.rstrip(os.sep)))
     os.makedirs(out, exist_ok=True)
@@ -899,6 +904,31 @@ def stage_post_mf2_calibrate(logger) -> Optional[str]:
     logger.info("[MF2:CALIB] calibracao isotonica aplicada.")
     return "ok"
 
+# ------------------------------------------------------------
+# Viz de ondas 
+# ------------------------------------------------------------
+def stage_viz_waves(logger):
+    if not ENABLE_VIZ_WAVE:
+        logger.info("[VIZ WAVES] desativado.")
+        return
+
+    try:
+        from viz.waveview import generate_from_pipeline
+    except Exception as e:
+        logger.error(f"[VIZ WAVES] módulo viz.waveview não disponível: {e}")
+        return
+
+    try:
+        out_dir = generate_from_pipeline(
+            data_processed=DATA_PROCESSED,
+            reports_dir=REPORTS_DIR,
+            max_plots=3
+        )
+        logger.info(f"[VIZ WAVES] figuras criadas em {out_dir}")
+    except Exception as e:
+        logger.error(f"[VIZ WAVES] falhou: {e}")
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -911,7 +941,8 @@ def main():
     logger.info(
         "Toggles: "
         f"download={ENABLE_DOWNLOAD} | whiten={ENABLE_WHITEN} | windows={ENABLE_WINDOWS} | "
-        f"dataset={ENABLE_DATASET} | ML={ENABLE_BASELINE_ML} | MF={ENABLE_MF_BASELINE} | MF2={ENABLE_MF_STAGE2}"
+        f"dataset={ENABLE_DATASET} | ML={ENABLE_BASELINE_ML} | MF={ENABLE_MF_BASELINE} | MF2={ENABLE_MF_STAGE2} | "
+        f"viz_waves={ENABLE_VIZ_WAVE}"
     )
     logger.info(f"Profile={PROFILE} | RAW={DATA_RAW} | INTERIM={DATA_INTERIM} | PROCESSED={DATA_PROCESSED}")
     logger.info("=============================================")
@@ -921,10 +952,10 @@ def main():
         try:
             preflight(logger)
         except SystemExit:
-            logger.error("Pré-flight detectou problemas críticos. Corrija e rode novamente.")
+            logger.error("Pré flight detectou problemas críticos. Corrija e rode novamente.")
             return
         except Exception as e:
-            logger.error(f"Pré-flight falhou de modo inesperado: {e}")
+            logger.error(f"Pré flight falhou de modo inesperado: {e}")
             if PREFLIGHT_FAIL_FAST:
                 return
 
@@ -964,12 +995,12 @@ def main():
         logger.info(f"[MF] Concluído em {t():.1f}s")
         _summarize_latest_mf(logger)
         try:
-            logger.info("[VIZ] Gerando timeline de scores (MF e ML) …")
+            logger.info("[VIZ] Gerando timeline de scores (MF e ML) ...")
             viz_timeline.main()
         except Exception as e:
             logger.error(f"[VIZ] timeline falhou: {e}")
         try:
-            logger.info("[VIZ] Gerando overlay H1 L1 …")
+            logger.info("[VIZ] Gerando overlay H1 L1 ...")
             viz_overlay.main()
         except Exception as e:
             logger.error(f"[VIZ] overlay falhou: {e}")
@@ -979,11 +1010,21 @@ def main():
     tag_mf2 = stage_mf_stage2(logger)
     if tag_mf2:
         logger.info(f"[MF2] Concluído em {t():.1f}s")
-        # Pós MF2
         t = _timer(); stage_post_mf2_freeze(logger);    logger.info(f"[MF2:FREEZE] em {t():.1f}s")
         t = _timer(); stage_post_mf2_export(logger);    logger.info(f"[MF2:EXPORT] em {t():.1f}s")
         t = _timer(); stage_post_mf2_coinc(logger);     logger.info(f"[MF2:COINC] em {t():.1f}s")
         t = _timer(); stage_post_mf2_calibrate(logger); logger.info(f"[MF2:CALIB] em {t():.1f}s")
+
+    # 8) VISUALIZAÇÕES DE INSIGHT
+    try:
+        from viz.insight_views import generate_all_views
+        generate_all_views(ROOT)
+        logger.info("[VIZ] Visualizações de insight geradas em reports/viz_insights/")
+    except Exception as e:
+        logger.error(f"[VIZ] Falha ao gerar visualizações de insight: {e}") 
+
+    # 9) VIZ DE ONDAS (usa dataset e windows já gerados)
+    stage_viz_waves(logger)
 
     # RESUMO
     raw_count       = len(_list_files(os.path.join(DATA_RAW, "*.hdf5")))
