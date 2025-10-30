@@ -30,3 +30,6 @@ __pycache__/
 generate_readme.py
 /reports
 /results
+/runs
+/artifacts
+/build

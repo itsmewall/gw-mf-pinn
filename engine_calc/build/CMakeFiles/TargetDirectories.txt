@@ -1,0 +1,3 @@
+/home/wallace/gw-mf-pinn/engine_calc/build/CMakeFiles/calc_engine.dir
+/home/wallace/gw-mf-pinn/engine_calc/build/CMakeFiles/edit_cache.dir
+/home/wallace/gw-mf-pinn/engine_calc/build/CMakeFiles/rebuild_cache.dir

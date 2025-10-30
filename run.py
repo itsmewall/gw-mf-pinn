@@ -42,11 +42,11 @@ from viz import ligo_overlay as viz_overlay
 # TOGGLES
 # ============================================================
 ENABLE_DOWNLOAD      = False
-ENABLE_WHITEN        = True
-ENABLE_WINDOWS       = True
-ENABLE_DATASET       = True
-ENABLE_BASELINE_ML   = True
-ENABLE_MF_BASELINE   = True
+ENABLE_WHITEN        = False
+ENABLE_WINDOWS       = False
+ENABLE_DATASET       = False
+ENABLE_BASELINE_ML   = False
+ENABLE_MF_BASELINE   = False
 ENABLE_MF_STAGE2     = True
 
 # Pós MF2
