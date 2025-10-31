@@ -21,6 +21,7 @@ import pandas as pd
 import h5py
 from fractions import Fraction
 from scipy.signal import resample_poly
+from sklearn.metrics import precision_recall_curve
 
 import torch
 import torch.nn as nn
@@ -63,22 +64,22 @@ class HParams:
     SUBSETS: Tuple[str, ...] = ("train","val","test")
 
     # treino
-    EPOCHS: int       = 12
-    BATCH: int        = 128
+    EPOCHS: int       = 2
+    BATCH: int        = 256
     LR: float         = 2e-4
     WD: float         = 1e-4
     OPT: str          = "adamw"
     AMP: bool         = True
     GRAD_CLIP: float  = 1.0
-    NUM_WORKERS: int  = 8
+    NUM_WORKERS: int  = 12
     PIN_MEMORY: bool  = True
-    PREFETCH: int     = 8
+    PREFETCH: int     = 4
     PERSISTENT: bool  = True
     SEED: int         = 2025
     DEVICE: str       = "cuda"
     CHECKPOINTING: bool = False
     COMPILE: bool       = True
-    EVAL_EVERY: int     = 3          # reduz overhead de validação
+    EVAL_EVERY: int     = 2          # reduz overhead de validação
 
     # perdas
     W_BCE: float      = 1.0
@@ -595,6 +596,12 @@ def _predict_scores(model, dl, device, desc="scoring"):
     pbar.close()
     return pd.DataFrame(rows, columns=["file_id","start_gps","label","score"])
 
+def _choose_threshold_best_f1(labels, scores):
+    p, r, thr = precision_recall_curve(labels, scores)
+    f1 = 2*p*r/(p+r+1e-9)
+    i = f1.argmax()
+    return float(thr[i]), float(p[i]), float(r[i]), float(f1[i])
+
 def export_latest(out_dir_root: Optional[str] = None):
     """
     Usa o best checkpoint do último treino em runs/mf/<ts> e só exporta scores/thresholds.
@@ -643,7 +650,7 @@ def export_latest(out_dir_root: Optional[str] = None):
     _predict_scores(model, dl_te, device, desc="MF2 scoring TEST").to_csv(test_csv, index=False)
 
     val_df  = pd.read_csv(val_csv); test_df = pd.read_csv(test_csv)
-    info_thr = _choose_threshold_by_far(val_df["label"].values, val_df["score"].values, target_fpr=1e-4)
+    info_thr = _choose_threshold_by_far(val_df["label"].values, val_df["score"].values, target_fpr=5e-4)
     thr = float(info_thr["threshold"])
     tn, fp, fn, tp = _confusion_at_thr(test_df["label"].values, test_df["score"].values, thr)
     prec = tp / max(tp+fp, 1); rec = tp / max(tp+fn, 1); fpr = fp / max(tn+fp, 1)

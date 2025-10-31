@@ -45,11 +45,11 @@ except Exception:
 # TOGGLES
 # ============================================================
 ENABLE_DOWNLOAD      = False
-ENABLE_WHITEN        = True
-ENABLE_WINDOWS       = True
-ENABLE_DATASET       = True
-ENABLE_BASELINE_ML   = True
-ENABLE_MF_BASELINE   = True
+ENABLE_WHITEN        = False
+ENABLE_WINDOWS       = False
+ENABLE_DATASET       = False
+ENABLE_BASELINE_ML   = False
+ENABLE_MF_BASELINE   = False
 ENABLE_MF_STAGE2     = True
 
 # Visualização de ondas
@@ -62,8 +62,8 @@ ENABLE_POST_MF2_COINC     = True
 ENABLE_POST_MF2_CALIBRATE = True
 
 # Pré flight
-ENABLE_PREFLIGHT        = True
-PREFLIGHT_FAIL_FAST     = True
+ENABLE_PREFLIGHT        = False
+PREFLIGHT_FAIL_FAST     = False
 PREFLIGHT_SAMPLE_VAL    = 64
 PREFLIGHT_MIN_WINDOWS   = 1
 PREFLIGHT_MIN_WHITENED  = 1
